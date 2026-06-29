@@ -22,7 +22,7 @@ import numpy as np
 import redis
 
 from . import config, envelope, store
-from .model import VioModel
+from .model import VioModel, person_crop_box, quiet_ml_logs, suppress_native_logs
 
 _stop = False
 
@@ -52,6 +52,7 @@ class CamWindow:
     def __init__(self):
         self.frames: deque = deque(maxlen=config.WIN_LEN)
         self.persons: deque = deque(maxlen=config.WIN_LEN)
+        self.boxes: deque = deque(maxlen=config.WIN_LEN)   # bbox người từng frame → crop vùng người
         self.boxes_last: list = []
         self.since_last = 0
         self.last_ts = 0.0
@@ -62,7 +63,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
 
-    model = VioModel()
+    quiet_ml_logs()
+    with suppress_native_logs():        # nuốt log TRT khi nạp engine + warmup (1 lần)
+        model = VioModel()
+        model.predict([np.zeros((config.CLIP_SIZE, config.CLIP_SIZE, 3), np.uint8)] * config.WIN_LEN)
     media = store.MediaStore()
     r = redis.from_url(config.REDIS_URL)
     cams: dict[str, CamWindow] = defaultdict(CamWindow)
@@ -107,6 +111,7 @@ def main() -> None:
             cam = cams[g["camera_id"]]
             cam.frames.append(img)
             cam.persons.append(g["num_persons"])
+            cam.boxes.append(g["boxes"])
             cam.boxes_last = g["boxes"]
             cam.since_last += 1
             cam.last_ts = g["ts"]
@@ -119,7 +124,15 @@ def main() -> None:
                 cam.since_last = 0
                 frames = list(cam.frames)
                 med_persons = int(statistics.median(cam.persons))
-                prob = model.predict(frames)
+                # Crop quanh vùng người (union cả cửa sổ) → classifier soi đúng chỗ, bù domain gap.
+                clip = frames
+                if config.CROP_TO_PERSON:
+                    h0, w0 = frames[-1].shape[:2]
+                    cb = person_crop_box(list(cam.boxes), w0, h0, config.CROP_PAD)
+                    if cb:
+                        x1, y1, x2, y2 = cb
+                        clip = [f[y1:y2, x1:x2] for f in frames]
+                prob = model.predict(clip)
                 classified += 1
 
                 snapshot_key, clip_key = "", ""

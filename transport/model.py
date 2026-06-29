@@ -9,6 +9,7 @@ KHÔNG bắn alert giả). Phải fine-tune rồi trỏ VIO_CKPT mới có giá 
 """
 from __future__ import annotations
 
+import math
 import os
 
 import cv2
@@ -21,6 +22,98 @@ _MEAN = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
 _STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
 
 _BACKBONES = {"r2plus1d_18", "mc3_18", "r3d_18", "s3d", "mvit_v1_b", "mvit_v2_s"}
+
+
+class _TrtRunner:
+    """Chạy engine TensorRT (FP16, strongly-typed). I/O qua torch tensor data_ptr — không pycuda.
+
+    Cùng pattern train/test_trt.py nhưng nằm trong transport để classifier live dùng được.
+    """
+    def __init__(self, engine_path: str, device: str = "cuda:0"):
+        import tensorrt as trt
+        import torch
+        self.trt, self.torch, self.device = trt, torch, device
+        logger = trt.Logger(trt.Logger.ERROR)
+        with open(engine_path, "rb") as f, trt.Runtime(logger) as rt:
+            self.engine = rt.deserialize_cuda_engine(f.read())
+        self.ctx = self.engine.create_execution_context()
+        self.in_name = self.out_name = None
+        for i in range(self.engine.num_io_tensors):
+            n = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT:
+                self.in_name = n
+            else:
+                self.out_name = n
+        _np = {trt.float32: torch.float32, trt.float16: torch.float16}
+        self.in_dtype = _np[self.engine.get_tensor_dtype(self.in_name)]
+        self.out_shape = tuple(self.engine.get_tensor_shape(self.out_name))
+        self.out_dtype = _np[self.engine.get_tensor_dtype(self.out_name)]
+        self.stream = torch.cuda.Stream()
+
+    def infer(self, x):
+        """x: torch tensor [1,C,T,H,W] trên cuda → prob lớp 1 (bạo lực)."""
+        inp = x.to(self.device, self.in_dtype).contiguous()
+        out = self.torch.empty(self.out_shape, dtype=self.out_dtype, device=self.device)
+        self.ctx.set_tensor_address(self.in_name, inp.data_ptr())
+        self.ctx.set_tensor_address(self.out_name, out.data_ptr())
+        self.ctx.execute_async_v3(self.stream.cuda_stream)
+        self.stream.synchronize()
+        return self.torch.softmax(out.float(), dim=1)[0, 1].item()
+
+
+def quiet_ml_logs() -> None:
+    """Tắt log ồn của ultralytics (torchvision-incompat, guess-task, "Loading…") — qua logger Python."""
+    import logging
+    os.environ.setdefault("YOLO_VERBOSE", "False")
+    logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def suppress_native_logs():
+    """Nuốt log C/C++ (TensorRT [I]/[W], engine-size…) bằng cách tạm chuyển fd 1+2 sang /dev/null.
+
+    Log của TRT in thẳng ở tầng native nên redirect_stdout (Python) không bắt được — phải đổi fd.
+    Chỉ bọc lúc NẠP engine (1 lần lúc khởi động), không bọc lúc chạy để không nuốt log thật.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old1, old2 = os.dup(1), os.dup(2)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(old1, 1)
+        os.dup2(old2, 2)
+        for fd in (devnull, old1, old2):
+            os.close(fd)
+
+
+def person_crop_box(boxes_per_frame: list, W: int, H: int, pad: float):
+    """Union mọi bbox người trong cửa sổ → hộp VUÔNG có đệm, kẹp trong khung.
+
+    boxes_per_frame: list theo từng frame, mỗi phần tử là list bbox [x,y,w,h] (góc trên-trái).
+    Trả (x1,y1,x2,y2) để crop, hoặc None nếu không có người / hộp quá nhỏ (→ caller dùng cả khung).
+    Vuông hóa: hành động bạo lực thường lan theo cả 2 chiều; tránh méo khi resize 112×112.
+    """
+    pts = [b for bs in boxes_per_frame for b in bs]
+    if not pts:
+        return None
+    x1 = min(b[0] for b in pts)
+    y1 = min(b[1] for b in pts)
+    x2 = max(b[0] + b[2] for b in pts)
+    y2 = max(b[1] + b[3] for b in pts)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    side = max(x2 - x1, y2 - y1) * (1 + 2 * pad)  # cạnh vuông + đệm 2 bên
+    x1, x2 = int(cx - side / 2), int(cx + side / 2)
+    y1, y2 = int(cy - side / 2), int(cy + side / 2)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(W, x2), min(H, y2)
+    if x2 - x1 < 16 or y2 - y1 < 16:  # hộp suy biến → để caller dùng cả khung
+        return None
+    return x1, y1, x2, y2
 
 
 def build_backbone(name: str, num_classes: int = 2, pretrained: bool = True):
@@ -44,30 +137,44 @@ def build_backbone(name: str, num_classes: int = 2, pretrained: bool = True):
 
 class VioModel:
     def __init__(self, ckpt: str | None = None, backbone: str | None = None,
-                 device: str | None = None, half: bool | None = None):
+                 device: str | None = None, half: bool | None = None,
+                 engine: str | None = None):
         self.backbone = backbone or config.VIO_BACKBONE
         self.device = device or config.VIO_DEVICE
         self.half = config.VIO_HALF if half is None else half
         self.dummy = True
+        self.mode = "dummy"
         self.model = None
+        self.engine = None
+        engine = engine if engine is not None else config.VIO_ENGINE
         ckpt = ckpt if ckpt is not None else config.VIO_CKPT
+        dev = f"cuda:{self.device}" if self.device.isdigit() else self.device
+        self.dev = dev
 
-        if ckpt and os.path.exists(ckpt):
+        if engine and os.path.exists(engine):
+            # Ưu tiên engine TensorRT FP16 (full-TRT) — preprocess ra fp16, infer qua engine.
+            import torch
+            self.torch = torch
+            self.engine = _TrtRunner(engine, device=dev if dev != "cpu" else "cuda:0")
+            self.half = self.engine.in_dtype == torch.float16
+            self.dummy = False
+            self.mode = "engine"
+            print(f"[model] loaded TensorRT engine={engine} device={dev} in_dtype={self.engine.in_dtype}")
+        elif ckpt and os.path.exists(ckpt):
             import torch
             self.torch = torch
             self.model = build_backbone(self.backbone, num_classes=2, pretrained=False)
             state = torch.load(ckpt, map_location="cpu")
             self.model.load_state_dict(state.get("model", state))
-            dev = f"cuda:{self.device}" if self.device.isdigit() else self.device
             self.model = self.model.to(dev).eval()
             if self.half and dev != "cpu":
                 self.model = self.model.half()
-            self.dev = dev
             self.dummy = False
+            self.mode = "torch"
             print(f"[model] loaded {self.backbone} ckpt={ckpt} device={dev} half={self.half}")
         else:
-            print(f"[model] ⚠ không thấy checkpoint ({ckpt}) → DUMMY mode (prob=0). "
-                  f"Fine-tune bằng train/train_clip.py rồi trỏ VIO_CKPT.")
+            print(f"[model] ⚠ không thấy engine/checkpoint → DUMMY mode (prob=0). "
+                  f"Train rồi trỏ VIO_ENGINE (.engine) hoặc VIO_CKPT (.pt).")
 
     def preprocess(self, frames: list[np.ndarray]):
         """list BGR (len = WIN_LEN) → tensor [1, C, T, H, W] chuẩn Kinetics."""
@@ -86,10 +193,14 @@ class VioModel:
 
     def predict(self, frames: list[np.ndarray]) -> float:
         """Trả prob bạo lực [0..1] cho 1 clip."""
-        if self.dummy or self.model is None:
+        if self.dummy:
             return 0.0
         with self.torch.no_grad():
             x = self.preprocess(frames)
-            logits = self.model(x)
-            prob = self.torch.softmax(logits.float(), dim=1)[0, 1].item()
-        return float(prob)
+            if self.mode == "engine":
+                prob = self.engine.infer(x)
+            else:
+                logits = self.model(x)
+                prob = self.torch.softmax(logits.float(), dim=1)[0, 1].item()
+        # Chặn NaN/inf (FP16 thi thoảng tràn) → state/JSON không vỡ.
+        return float(prob) if math.isfinite(prob) else 0.0

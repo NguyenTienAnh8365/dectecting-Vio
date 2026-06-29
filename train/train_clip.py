@@ -39,10 +39,40 @@ def label_of(path: str) -> int:
 
 
 def sample_frames(path: str, clip_len: int, size: int, train: bool) -> np.ndarray | None:
-    """Lấy clip_len frame trải đều (train: jitter ngẫu nhiên) → [T,H,W,C] RGB chuẩn hóa."""
+    """Lấy clip_len frame trải đều (train: jitter ngẫu nhiên) → [T,H,W,C] RGB chuẩn hóa.
+
+    Đọc TUẦN TỰ bằng grab()/retrieve(): grab() lướt frame không decode (rẻ), chỉ
+    retrieve() (decode) ở đúng index cần. Tránh cap.set(POS_FRAMES) seek-keyframe vốn
+    cực chậm với h264 → giữ GPU bận thay vì nghẽn dataloader.
+    """
     cap = cv2.VideoCapture(path)
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    if n <= 0:
+    if n > 0:
+        idxs = np.linspace(0, n - 1, clip_len)
+        if train:
+            idxs = np.clip(idxs + np.random.randint(-2, 3, clip_len), 0, n - 1)
+        want = idxs.astype(int)                         # tăng dần, có thể trùng
+        order = np.argsort(want, kind="stable")
+        cur, frames_by_pos = -1, {}
+        last = None
+        for pos in order:
+            target = int(want[pos])
+            while cur < target:
+                if not cap.grab():
+                    break
+                cur += 1
+            ok, fr = cap.retrieve() if cur == target else (False, None)
+            if ok:
+                last = fr
+            frames_by_pos[pos] = fr if ok else last
+        cap.release()
+        sel = [frames_by_pos.get(i) for i in range(clip_len)]
+        # vá frame None (đầu clip lỗi) bằng frame hợp lệ gần nhất
+        valid = next((f for f in sel if f is not None), None)
+        if valid is None:
+            return None
+        sel = [f if f is not None else valid for f in sel]
+    else:
         frames = []
         while True:
             ok, fr = cap.read()
@@ -54,18 +84,6 @@ def sample_frames(path: str, clip_len: int, size: int, train: bool) -> np.ndarra
             return None
         idxs = np.linspace(0, len(frames) - 1, clip_len).astype(int)
         sel = [frames[i] for i in idxs]
-    else:
-        idxs = np.linspace(0, n - 1, clip_len)
-        if train:
-            idxs = np.clip(idxs + np.random.randint(-2, 3, clip_len), 0, n - 1)
-        sel = []
-        for i in idxs.astype(int):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
-            ok, fr = cap.read()
-            if not ok:
-                ok, fr = cap.read()
-            sel.append(fr if ok else (sel[-1] if sel else np.zeros((size, size, 3), np.uint8)))
-        cap.release()
 
     out = []
     flip = train and random.random() < 0.5

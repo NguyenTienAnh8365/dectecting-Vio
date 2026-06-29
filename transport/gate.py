@@ -22,9 +22,9 @@ import time
 import cv2
 import numpy as np
 import redis
-from ultralytics import YOLO
-
 from . import config, envelope
+from .model import quiet_ml_logs, suppress_native_logs
+# YOLO import lazy trong main() (bên trong suppressor) → nuốt cả warning torchvision lúc import.
 
 _stop = False
 
@@ -108,7 +108,7 @@ def process_batch(model, r, entries) -> int:
 
     results = model.predict(
         imgs, device=config.GATE_DEVICE, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
-        classes=[config.PERSON_CLASS], half=config.GATE_HALF, verbose=False,
+        classes=[config.PERSON_CLASS], quantize=config.GATE_QUANTIZE, verbose=False,
     )
 
     for eid, req, res, raw in zip(ids, reqs, results, raws):
@@ -129,9 +129,13 @@ def main() -> None:
 
     name = consumer_name()
     print(f"[gate {name}] loading {config.GATE_MODEL} device={config.GATE_DEVICE} imgsz={config.GATE_IMGSZ}")
-    model = YOLO(config.GATE_MODEL)
-    model.predict(np.zeros((config.GATE_IMGSZ, config.GATE_IMGSZ, 3), np.uint8),
-                  device=config.GATE_DEVICE, half=config.GATE_HALF, classes=[config.PERSON_CLASS], verbose=False)
+    quiet_ml_logs()
+    with suppress_native_logs():        # nuốt log TRT/ultralytics (cả warning torchvision lúc import) + warmup
+        from ultralytics import YOLO
+        model = YOLO(config.GATE_MODEL, task="detect", verbose=False)
+        model.predict(np.zeros((config.GATE_IMGSZ, config.GATE_IMGSZ, 3), np.uint8),
+                      device=config.GATE_DEVICE, quantize=config.GATE_QUANTIZE,
+                      classes=[config.PERSON_CLASS], verbose=False)
     r = redis.from_url(config.REDIS_URL)
     print(f"[gate {name}] ready. consuming {config.REQ_STREAM} group {config.CG_GATE}")
 

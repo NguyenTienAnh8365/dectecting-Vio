@@ -46,7 +46,10 @@ class MediaStore:
         return key
 
     def save_clip_async(self, camera_id: str, ts: float, frames: list[np.ndarray], fps: float = 12.0) -> str:
-        """Ghi clip MP4 từ list frame BGR (cửa sổ bằng chứng). Trả key tương đối."""
+        """Ghi clip MP4 H.264 từ list frame BGR (cửa sổ bằng chứng) — phát được trên web.
+
+        Dùng imageio + imageio-ffmpeg (libx264 yuv420p); opencv mp4v KHÔNG phát trên trình duyệt.
+        """
         key = self._key(camera_id, ts, "clip", "mp4")
         path = os.path.join(self.root, key)
         clip = [f.copy() for f in frames]
@@ -54,17 +57,18 @@ class MediaStore:
             return ""
 
         def _do():
+            import imageio
             os.makedirs(os.path.dirname(path), exist_ok=True)
             h, w = clip[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            vw = cv2.VideoWriter(path, fourcc, fps, (w, h))
-            if not vw.isOpened():
-                return
+            w -= w % 2; h -= h % 2  # H.264 yuv420p cần kích thước chẵn
+            writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=7,
+                                        macro_block_size=1, pixelformat="yuv420p",
+                                        ffmpeg_log_level="error")
             for fr in clip:
                 if fr.shape[:2] != (h, w):
                     fr = cv2.resize(fr, (w, h))
-                vw.write(fr)
-            vw.release()
+                writer.append_data(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+            writer.close()
 
         self._pool.submit(_do)
         return key

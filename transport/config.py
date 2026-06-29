@@ -71,22 +71,41 @@ GATE_IMGSZ = _int("GATE_IMGSZ", 640)
 GATE_CONF = _float("GATE_CONF", 0.35)
 GATE_DEVICE = os.getenv("GATE_DEVICE", "0")
 GATE_HALF = os.getenv("GATE_HALF", "1") == "1"
+# ultralytics mới bỏ tham số predict 'half' → dùng 'quantize' (16=FP16, None=FP32). Map sẵn.
+GATE_QUANTIZE = 16 if GATE_HALF else None
 PERSON_CLASS = _int("PERSON_CLASS", 0)  # COCO 'person'
 # Số người tối thiểu trong cửa sổ để alert được kích hoạt (gate alert, không gate frame).
 MIN_PERSONS = _int("MIN_PERSONS", 2)
+# Phân tích video upload: chỉ chạy YOLO mỗi N frame (tái dùng bbox cho overlay giữa các lần)
+# → giảm số lần infer gate, nhanh hơn. Vẫn ép chạy gate đúng frame quyết định cửa sổ để
+# đếm người chính xác. Tăng lên 3-4 nếu cần nhanh hơn nữa (bbox trễ tối đa N frame).
+ANALYZE_GATE_EVERY = _int("ANALYZE_GATE_EVERY", 2)
 
 # --- Classifier clip-level --------------------------------------------------
 VIO_BACKBONE = os.getenv("VIO_BACKBONE", "r2plus1d_18")  # torchvision.models.video
+VIO_ENGINE = os.getenv("VIO_ENGINE", "")  # .engine TensorRT FP16 (ưu tiên nếu có) → full-TRT
 VIO_CKPT = os.getenv("VIO_CKPT", "weights/vio_r2plus1d.pt")  # rỗng/không tồn tại → dummy mode
 VIO_DEVICE = os.getenv("VIO_DEVICE", "0")
 VIO_HALF = os.getenv("VIO_HALF", "1") == "1"
 WIN_LEN = _int("WIN_LEN", 16)        # số frame mỗi clip
 WIN_STRIDE = _int("WIN_STRIDE", 8)   # phân loại lại mỗi N frame mới (cửa sổ trượt)
 CLIP_SIZE = _int("CLIP_SIZE", 112)   # cạnh ảnh đưa vào model (r2plus1d/mc3 = 112)
+# Cắt quanh vùng người (union bbox YOLO) TRƯỚC khi đưa vào classifier → hành động bạo lực
+# to gần kín khung như RLVS, bù domain gap với CCTV góc rộng (người nhỏ, co về 112 mất tín
+# hiệu). Tắt bằng CROP_TO_PERSON=0. CROP_PAD = phần đệm quanh union (tỉ lệ cạnh).
+CROP_TO_PERSON = os.getenv("CROP_TO_PERSON", "1") == "1"
+CROP_PAD = _float("CROP_PAD", 0.35)
 MODEL_VERSION = os.getenv("MODEL_VERSION", "untrained")
 
 # --- Logic alert (dashboard): chống false-positive + spam ------------------
-VIO_THRESHOLD = _float("VIO_THRESHOLD", 0.70)  # ngưỡng prob 1 cửa sổ tính là "dương"
+# Ngưỡng KÉP theo độ tin cậy (tránh bỏ sót hành động bạo lực ngắn 1-2 cửa sổ):
+#   • đường KÉO DÀI: cửa sổ "dương" khi prob ≥ VIO_THRESHOLD; cần K/N dương → alert.
+#     Bắt bạo lực độ tin cậy vừa nhưng liên tục, đồng thời lọc nhiễu lẻ (chống FP).
+#   • đường MẠNH:    chỉ 1 cửa sổ prob ≥ VIO_THRESHOLD_STRONG đã đủ alert ngay, KHÔNG
+#     cần đủ K/N. Bắt cú đánh/tát chớp nhoáng — "1 hành động nhỏ cũng là bạo lực".
+# => verdict = (đủ K/N ở mức thấp) OR (có ≥1 cửa sổ ở mức mạnh). Cả hai vẫn qua gate người.
+VIO_THRESHOLD = _float("VIO_THRESHOLD", 0.50)         # ngưỡng "dương" cho đường kéo dài
+VIO_THRESHOLD_STRONG = _float("VIO_THRESHOLD_STRONG", 0.80)  # 1 cửa sổ ≥ mức này → alert ngay
 ALERT_K = _int("ALERT_K", 3)         # cần K cửa sổ dương...
 ALERT_N = _int("ALERT_N", 5)         # ...trong N cửa sổ gần nhất → alert
 COOLDOWN_S = _int("COOLDOWN_S", 45)  # mỗi camera tối đa 1 alert / COOLDOWN_S giây
