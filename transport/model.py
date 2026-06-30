@@ -17,11 +17,86 @@ import numpy as np
 
 from . import config
 
-# Chuẩn hóa Kinetics (đúng tiền xử lý weights pretrained torchvision video).
-_MEAN = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
-_STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
+# Spec tiền xử lý theo BACKBONE — nguồn chân lý DUY NHẤT cho size/clip_len/normalize, dùng
+# chung cho train (train_clip.py) lẫn infer (preprocess) để KHÔNG bao giờ lệch train/serve.
+# CNN video (r2plus1d/mc3/r3d): 112×112, mean/std torchvision VideoClassification.
+# Transformer (mvit_*): 224×224, 16 frame CỐ ĐỊNH (positional-embed gắn cứng), norm Kinetics [0.45]/[0.225].
+_KIN_CNN_MEAN, _KIN_CNN_STD = [0.43216, 0.394666, 0.37645], [0.22803, 0.22145, 0.216989]
+_KIN_T_MEAN, _KIN_T_STD = [0.45, 0.45, 0.45], [0.225, 0.225, 0.225]
+BACKBONE_SPEC = {
+    "r2plus1d_18": dict(size=112, clip_len=16, mean=_KIN_CNN_MEAN, std=_KIN_CNN_STD),
+    "mc3_18":      dict(size=112, clip_len=16, mean=_KIN_CNN_MEAN, std=_KIN_CNN_STD),
+    "r3d_18":      dict(size=112, clip_len=16, mean=_KIN_CNN_MEAN, std=_KIN_CNN_STD),
+    "s3d":         dict(size=224, clip_len=16, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    "mvit_v1_b":   dict(size=224, clip_len=16, mean=_KIN_T_MEAN, std=_KIN_T_STD),
+    "mvit_v2_s":   dict(size=224, clip_len=16, mean=_KIN_T_MEAN, std=_KIN_T_STD),
+}
+_BACKBONES = set(BACKBONE_SPEC)
 
-_BACKBONES = {"r2plus1d_18", "mc3_18", "r3d_18", "s3d", "mvit_v1_b", "mvit_v2_s"}
+
+def spec_of(backbone: str) -> dict:
+    if backbone not in BACKBONE_SPEC:
+        raise ValueError(f"backbone không hỗ trợ: {backbone} (chọn {sorted(BACKBONE_SPEC)})")
+    return BACKBONE_SPEC[backbone]
+
+
+def even_indices(n: int, k: int) -> list[int]:
+    """k chỉ số trải đều trong [0, n-1] (linspace). Dùng để lấy 16 frame đều từ buffer span thời gian
+    → khớp cách training sample (16 frame trải đều cả clip), tránh lệch train/serve về thời gian."""
+    if n <= 0:
+        return [0] * k
+    return [int(round(x)) for x in np.linspace(0, n - 1, k)]
+
+
+def multispan_predict(model, frames: list, boxes: list, spans_frames: list[int], W: int, H: int):
+    """MAX prob qua nhiều SPAN thời gian. frames/boxes = buffer dài (= span lớn nhất).
+
+    Với mỗi span: lấy `span` frame gần nhất → even_indices WIN_LEN → crop union người CỦA các frame
+    đó → predict. Lấy max. Bắt cả đánh nhau NHANH (span ngắn) lẫn CHẬM/đám đông (span dài) —
+    1 span cố định không kham được cả hai (vd fight dashcam ~7s mù với span 3s). Trả (prob, crop_box).
+    """
+    n = len(frames)
+    clips, cbs = [], []
+    for sf in sorted(set(int(s) for s in spans_frames)):
+        sf = min(max(sf, config.WIN_LEN), n)
+        seg_f, seg_b = frames[n - sf:], boxes[n - sf:]
+        sel = even_indices(len(seg_f), config.WIN_LEN)
+        base = [seg_f[i] for i in sel]
+        # Thử CẢ full-frame LẪN crop-người → lấy max. Crop CHỈ giúp (cận cảnh CCTV), không bao giờ
+        # hại: cảnh đám đông/dashcam góc rộng thì full-frame mới bắt được (crop union ≈ cả khung).
+        clips.append(base); cbs.append(None)
+        if config.CROP_TO_PERSON:
+            cb = person_crop_box([seg_b[i] for i in sel], W, H, config.CROP_PAD)
+            if cb:
+                x1, y1, x2, y2 = cb
+                clips.append([f[y1:y2, x1:x2] for f in base]); cbs.append(cb)
+    probs = model.predict_batch(clips)  # GỘP 1 forward batch (nhanh hơn N lần tuần tự)
+    best, best_box = 0.0, None
+    for p, cb in zip(probs, cbs):
+        if p > best:
+            best, best_box = p, cb
+    return best, best_box
+
+
+def frames_to_clip(frames: list[np.ndarray], backbone: str, *, flip: bool = False) -> np.ndarray:
+    """list ảnh BGR → ndarray [C,T,H,W] float32 đã chuẩn hóa theo spec của backbone.
+
+    DÙNG CHUNG train+infer: resize vuông (INTER_AREA) → BGR→RGB → /255 → (x-mean)/std → [C,T,H,W].
+    `flip` (chỉ train) lật ngang nhất quán mọi frame trong clip. Đây là gốc rễ chống train/serve skew.
+    """
+    sp = spec_of(backbone)
+    size = sp["size"]
+    mean = np.asarray(sp["mean"], dtype=np.float32)
+    std = np.asarray(sp["std"], dtype=np.float32)
+    clip = []
+    for f in frames:
+        f = cv2.resize(f, (size, size), interpolation=cv2.INTER_AREA)
+        if flip:
+            f = cv2.flip(f, 1)
+        f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        clip.append((f - mean) / std)
+    arr = np.stack(clip, axis=0)            # [T, H, W, C]
+    return np.transpose(arr, (3, 0, 1, 2))  # [C, T, H, W]
 
 
 class _TrtRunner:
@@ -128,12 +203,12 @@ def build_backbone(name: str, num_classes: int = 2, pretrained: bool = True):
     # Thay đầu phân loại — vị trí khác nhau theo kiến trúc.
     if hasattr(model, "fc"):
         model.fc = nn.Linear(model.fc.in_features, num_classes)
-    elif hasattr(model, "head"):  # mvit
-        model.head = nn.Linear(model.head[-1].in_features, num_classes)
+    elif hasattr(model, "head"):  # mvit: head = Sequential(Dropout, Linear) → chỉ thay Linear, GIỮ Dropout
+        model.head[-1] = nn.Linear(model.head[-1].in_features, num_classes)
     elif hasattr(model, "classifier"):  # s3d
         model.classifier[-1] = nn.Conv3d(model.classifier[-1].in_channels, num_classes, 1)
     return model
-
+    
 
 class VioModel:
     def __init__(self, ckpt: str | None = None, backbone: str | None = None,
@@ -163,8 +238,11 @@ class VioModel:
         elif ckpt and os.path.exists(ckpt):
             import torch
             self.torch = torch
-            self.model = build_backbone(self.backbone, num_classes=2, pretrained=False)
             state = torch.load(ckpt, map_location="cpu")
+            # Ưu tiên backbone lưu trong checkpoint (tránh lệch nếu VIO_BACKBONE cấu hình sai).
+            if isinstance(state, dict) and state.get("backbone"):
+                self.backbone = state["backbone"]
+            self.model = build_backbone(self.backbone, num_classes=2, pretrained=False)
             self.model.load_state_dict(state.get("model", state))
             self.model = self.model.to(dev).eval()
             if self.half and dev != "cpu":
@@ -177,18 +255,9 @@ class VioModel:
                   f"Train rồi trỏ VIO_ENGINE (.engine) hoặc VIO_CKPT (.pt).")
 
     def preprocess(self, frames: list[np.ndarray]):
-        """list BGR (len = WIN_LEN) → tensor [1, C, T, H, W] chuẩn Kinetics."""
-        size = config.CLIP_SIZE
-        clip = []
-        for f in frames:
-            f = cv2.resize(f, (size, size), interpolation=cv2.INTER_AREA)
-            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            f = (f - _MEAN) / _STD
-            clip.append(f)
-        arr = np.stack(clip, axis=0)            # [T, H, W, C]
-        arr = np.transpose(arr, (3, 0, 1, 2))   # [C, T, H, W]
-        t = self.torch.from_numpy(arr).unsqueeze(0)  # [1, C, T, H, W]
-        t = t.to(self.dev)
+        """list BGR (len = WIN_LEN) → tensor [1, C, T, H, W] theo spec backbone (đồng nhất với train)."""
+        arr = frames_to_clip(frames, self.backbone)  # [C, T, H, W]
+        t = self.torch.from_numpy(arr).unsqueeze(0).to(self.dev)  # [1, C, T, H, W]
         return t.half() if (self.half and self.dev != "cpu") else t
 
     def predict(self, frames: list[np.ndarray]) -> float:
@@ -204,3 +273,23 @@ class VioModel:
                 prob = self.torch.softmax(logits.float(), dim=1)[0, 1].item()
         # Chặn NaN/inf (FP16 thi thoảng tràn) → state/JSON không vỡ.
         return float(prob) if math.isfinite(prob) else 0.0
+
+    def predict_batch(self, clips: list[list[np.ndarray]]) -> list[float]:
+        """Nhiều clip → 1 forward batch (GPU dùng hết công suất; batch-N ≈ batch-1 trên Blackwell).
+
+        Dùng cho multi-span (gộp các biến thể span×crop thành 1 lần infer thay vì N lần tuần tự).
+        Engine TRT batch tĩnh =1 → fallback loop predict.
+        """
+        if self.dummy:
+            return [0.0] * len(clips)
+        if not clips:
+            return []
+        if self.mode == "engine":
+            return [self.predict(c) for c in clips]
+        with self.torch.no_grad():
+            xs = [self.torch.from_numpy(frames_to_clip(c, self.backbone)) for c in clips]
+            x = self.torch.stack(xs).to(self.dev)
+            if self.half and self.dev != "cpu":
+                x = x.half()
+            probs = self.torch.softmax(self.model(x).float(), dim=1)[:, 1].tolist()
+        return [float(p) if math.isfinite(p) else 0.0 for p in probs]

@@ -15,7 +15,8 @@ import torch
 from transport.model import build_backbone
 
 
-def export_onnx(ckpt: str, onnx_path: str, clip_len: int, size: int, half: bool = True) -> None:
+def export_onnx(ckpt: str, onnx_path: str, clip_len: int, size: int,
+                half: bool = True, opset: int = 17) -> None:
     ck = torch.load(ckpt, map_location="cpu")
     backbone = ck.get("backbone", "r2plus1d_18")
     model = build_backbone(backbone, num_classes=2, pretrained=False)
@@ -28,9 +29,10 @@ def export_onnx(ckpt: str, onnx_path: str, clip_len: int, size: int, half: bool 
     torch.onnx.export(
         model, dummy, onnx_path,
         input_names=["clip"], output_names=["logits"],
-        opset_version=17, dynamo=False,
+        opset_version=opset, dynamo=False,
     )
-    print(f"[onnx] {onnx_path}  backbone={backbone}  in=[1,3,{clip_len},{size},{size}] dtype={dtype}")
+    print(f"[onnx] {onnx_path}  backbone={backbone}  in=[1,3,{clip_len},{size},{size}] "
+          f"dtype={dtype} opset={opset}")
 
 
 def build_engine(onnx_path: str, engine_path: str) -> None:
@@ -67,12 +69,14 @@ def main() -> None:
     ap.add_argument("--out", default="weights/vio_r2plus1d_fp16.engine")
     ap.add_argument("--clip-len", type=int, default=16)
     ap.add_argument("--size", type=int, default=112)
+    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--no-half", action="store_true", help="export FP32 (thử khi FP16 ONNX/TRT lỗi)")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")
     clip_len = ck.get("clip_len", args.clip_len)
     size = ck.get("size", args.size)
-    export_onnx(args.ckpt, args.onnx, clip_len, size)
+    export_onnx(args.ckpt, args.onnx, clip_len, size, half=not args.no_half, opset=args.opset)
     build_engine(args.onnx, args.out)
     print("done.")
 

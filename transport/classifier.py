@@ -22,7 +22,8 @@ import numpy as np
 import redis
 
 from . import config, envelope, store
-from .model import VioModel, person_crop_box, quiet_ml_logs, suppress_native_logs
+from .model import (VioModel, even_indices, multispan_predict, person_crop_box,
+                    quiet_ml_logs, suppress_native_logs)
 
 _stop = False
 
@@ -50,9 +51,11 @@ def annotate(frame: np.ndarray, boxes: list, prob: float) -> np.ndarray:
 class CamWindow:
     """Ring-buffer 1 camera: frame + meta cho cửa sổ trượt."""
     def __init__(self):
-        self.frames: deque = deque(maxlen=config.WIN_LEN)
-        self.persons: deque = deque(maxlen=config.WIN_LEN)
-        self.boxes: deque = deque(maxlen=config.WIN_LEN)   # bbox người từng frame → crop vùng người
+        # Buffer SPAN thời gian (WIN_SPAN = round(WIN_SECONDS*GRAB_FPS) frame) → lấy đều WIN_LEN=16
+        # frame lúc phân loại (khớp training). Tránh lệch train/serve về thời gian (xem config).
+        self.frames: deque = deque(maxlen=config.WIN_SPAN)
+        self.persons: deque = deque(maxlen=config.WIN_SPAN)
+        self.boxes: deque = deque(maxlen=config.WIN_SPAN)   # bbox người từng frame → crop vùng người
         self.boxes_last: list = []
         self.since_last = 0
         self.last_ts = 0.0
@@ -119,20 +122,16 @@ def main() -> None:
             total += 1
             r.xack(config.GATED_STREAM, config.CG_CLS, eid)
 
-            # Đủ frame + đủ stride → phân loại 1 cửa sổ.
-            if len(cam.frames) == config.WIN_LEN and cam.since_last >= config.WIN_STRIDE:
+            # ≥ WIN_LEN frame + đủ stride → MULTI-SPAN: max prob qua các span (đánh nhanh lẫn chậm/đám đông).
+            # Dùng >= WIN_LEN (không đợi đầy span) → clip/luồng ngắn vẫn được chấm; buffer trượt tối đa WIN_SPAN.
+            if len(cam.frames) >= config.WIN_LEN and cam.since_last >= config.WIN_STRIDE:
                 cam.since_last = 0
-                frames = list(cam.frames)
+                fr_all, bx_all = list(cam.frames), list(cam.boxes)
+                h0, w0 = fr_all[-1].shape[:2]
+                spans_frames = [round(s * config.GRAB_FPS) for s in config.WIN_SECONDS_LIST]
+                prob, _ = multispan_predict(model, fr_all, bx_all, spans_frames, w0, h0)
+                frames = [fr_all[i] for i in even_indices(len(fr_all), config.WIN_LEN)]  # cho snapshot/clip
                 med_persons = int(statistics.median(cam.persons))
-                # Crop quanh vùng người (union cả cửa sổ) → classifier soi đúng chỗ, bù domain gap.
-                clip = frames
-                if config.CROP_TO_PERSON:
-                    h0, w0 = frames[-1].shape[:2]
-                    cb = person_crop_box(list(cam.boxes), w0, h0, config.CROP_PAD)
-                    if cb:
-                        x1, y1, x2, y2 = cb
-                        clip = [f[y1:y2, x1:x2] for f in frames]
-                prob = model.predict(clip)
                 classified += 1
 
                 snapshot_key, clip_key = "", ""

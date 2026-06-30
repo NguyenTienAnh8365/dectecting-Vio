@@ -15,7 +15,8 @@ import imageio
 import numpy as np
 
 from . import config
-from .model import VioModel, person_crop_box, quiet_ml_logs, suppress_native_logs
+from .model import (VioModel, even_indices, multispan_predict, person_crop_box,
+                    quiet_ml_logs, suppress_native_logs)
 
 
 def _cv2_can_read(path: str) -> bool:
@@ -106,8 +107,10 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
                                 macro_block_size=1, pixelformat="yuv420p",
                                 ffmpeg_log_level="error")
 
-    win: deque = deque(maxlen=config.WIN_LEN)
-    box_hist: deque = deque(maxlen=config.WIN_LEN)   # bbox người từng frame → crop vùng người
+    # Buffer SPAN thời gian (round(WIN_SECONDS*fps) frame) → lấy đều WIN_LEN=16 frame (khớp training).
+    span = max(config.WIN_LEN, round(config.WIN_SECONDS * fps))
+    win: deque = deque(maxlen=span)
+    box_hist: deque = deque(maxlen=span)   # bbox người từng frame → crop vùng người
     since, prob, pos_windows, strong_hits, max_prob, max_t = 0, 0.0, 0, 0, 0.0, 0.0
     timeline, idx = [], 0
     poster, first_frame = None, None
@@ -123,7 +126,9 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
             first_frame = frame.copy()
         win.append(frame.copy())
         since += 1
-        deciding = len(win) == config.WIN_LEN and since >= config.WIN_STRIDE
+        # Phân loại khi có ≥ WIN_LEN frame (multispan tự cắt span theo số frame có) → clip NGẮN
+        # (< span buffer) vẫn được chấm, không bị bỏ sót. Buffer vẫn trượt tối đa `span` frame.
+        deciding = len(win) >= config.WIN_LEN and since >= config.WIN_STRIDE
         # Chạy YOLO mỗi gate_every frame, NHƯNG ép chạy đúng frame quyết định → đếm người chuẩn.
         if idx % gate_every == 0 or deciding:
             res = gate.predict(frame, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
@@ -133,14 +138,9 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
         box_hist.append(boxes)
         if deciding:
             since = 0
-            # Crop quanh vùng người (union cả cửa sổ) → classifier soi đúng chỗ, bù domain gap.
-            clip = list(win)
-            if config.CROP_TO_PERSON:
-                cb = person_crop_box(list(box_hist), W, H, config.CROP_PAD)
-                if cb:
-                    x1, y1, x2, y2 = cb
-                    clip = [f[y1:y2, x1:x2] for f in clip]
-            prob = model.predict(clip)
+            # MULTI-SPAN: lấy MAX prob qua các span (3s & 7s…) → bắt cả đánh nhanh lẫn chậm/đám đông.
+            spans_frames = [round(s * fps) for s in config.WIN_SECONDS_LIST]
+            prob, _ = multispan_predict(model, list(win), list(box_hist), spans_frames, W, H)
             t = idx / fps
             enough_persons = len(boxes) >= config.MIN_PERSONS
             is_strong = prob >= config.VIO_THRESHOLD_STRONG and enough_persons

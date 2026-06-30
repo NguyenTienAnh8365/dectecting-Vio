@@ -941,7 +941,6 @@ button { border: 0; }
   </div>
   <div class="top-actions">
     <span class="pill"><span class="dot" id="conn"></span><span id="connText">Đang kết nối</span></span>
-    <span class="pill" id="cfg">Đang tải cấu hình...</span>
   </div>
 </header>
 
@@ -1251,9 +1250,6 @@ es.onmessage = e => {
 
 // ── Init ──────────────────────────────────────────────────────────────────
 fetch('/api/state').then(r => r.json()).then(s => {
-  const c = s.config;
-  document.getElementById('cfg').textContent =
-    `Ngưỡng ${c.threshold * 100 | 0}% \u00b7 ${c.k}/${c.n} cửa sổ \u00b7 cooldown ${c.cooldown_s}s`;
   for (const [id, v] of Object.entries(s.live)) renderCam(id, v.prob, v.num_persons);
   s.alerts.slice().reverse().forEach(renderAlert);
 });

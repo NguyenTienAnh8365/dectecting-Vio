@@ -38,9 +38,14 @@ video upload ─> dashboard /api/upload ─> analyze.py (YOLO gate + classifier)
 | Mạng | Vai trò | Kế thừa từ | Train thêm? |
 |---|---|---|---|
 | **YOLO** (yolo26x) | định vị **người** (không gian) | `yolo26x.pt` — COCO pretrained | ❌ COCO đã có "person" |
-| **r2plus1d_18** | phân loại **bạo lực** (chuyển động, clip 16f) | `r2plus1d_18-91a641e6.pth` — Kinetics-400 | ✅ fine-tune RLVS (97.7%) |
+| **mvit_v2_s** | phân loại **bạo lực** (chuyển động, clip 16f×224) | `mvit_v2_s-…` — Kinetics-400 | ✅ fine-tune 5 dataset (val F1 0.969) |
 
-Cả hai đều build **TensorRT FP16 engine** để chạy nhanh (`yolo26x.engine`, `vio_r2plus1d_fp16.engine`).
+> **Đã đổi base model r2plus1d_18 → MViT v2-S** (video transformer mạnh hơn) + train production
+> đa-dataset. MViT cần input **16 frame × 224×224**, norm Kinetics [0.45]/[0.225] (CỐ ĐỊNH theo
+> positional-embed). YOLO gate vẫn build **TensorRT FP16** (`yolo26x.engine`). **MViT KHÔNG export
+> được TRT** (op `SequenceAt/Empty/Insert` của pooling-attention, parser TRT 11.x không hỗ trợ) →
+> classifier chạy **torch-FP16** từ `weights/vio_mvit_v2_s.pt` (vẫn nhanh trên Blackwell). Checkpoint
+> r2plus1d cũ + engine giữ làm fallback.
 
 ## Cài đặt (server Blackwell — dùng `uv`)
 
@@ -54,17 +59,31 @@ uv run python -m transport.init_streams
 > Chưa có checkpoint/engine? Pipeline vẫn chạy thông ở **dummy mode** (prob=0, không bắn
 > alert) để test transport/dashboard trước khi train xong.
 
-## 1) Data & fine-tune
+## 1) Data & fine-tune (production, 5 dataset đa-domain)
 
-- **RLVS** (Real Life Violence Situations, ~2.3k clip) — tải auth-free từ HuggingFace
-  `khoipd/Violence`, giải nén `data/RLVS/Real_Life_Violence_Dataset/{Violence,NonViolence}`.
-- **RWF-2000** (CCTV, đúng domain giám sát nhất) — xin form GitHub `mchengny/RWF2000` (cho tối ưu sau).
+| Dataset | Domain | Nguồn auth-free | Vai trò |
+|---|---|---|---|
+| **RLVS** (~2.3k) | street-fight cận cảnh | HF `khoipd/Violence` | train/val |
+| **RWF-2000** (~2k) | CCTV giám sát | HF `DanJoshua/RWF-2000` (tar.gz) | train/val |
+| **SCVD** (~480) | smart-city CCTV | HF `henriquequeirozcunha/scvd-violence-5fps` (parquet→mp4) | train/val |
+| **Surveillance Fight** (300) | CCTV công cộng | GitHub `sayibet/fight-detection-surv-dataset` | train/val |
+| **VioPeru** (367) | **CCTV thật Peru** | GitHub `hhuillcen/VioPeru` | **test cross-domain (giữ riêng)** |
+
+SCVD bỏ lớp **Weaponized** (súng/dao tĩnh ít motion → nhiễu nhãn cho 3D/transformer). Tải:
+`scripts/download_datasets.sh` + `scripts/build_scvd_clips.py`.
 
 ```bash
-uv run python -m train.train_clip --data data/RLVS --backbone r2plus1d_18 \
-    --epochs 8 --batch 8 --out weights/vio_r2plus1d.pt
-# build TensorRT FP16 (dùng default paths):  uv run python -m train.export_trt  → weights/vio_r2plus1d_fp16.engine
+uv run python -m train.build_manifest        # → data/manifest.csv (path,label,dataset,split)
+uv run python -m train.precompute_boxes       # cache crop-box người (crop-in-training, khớp infer)
+uv run python -m train.train_clip --backbone mvit_v2_s --epochs 60 --batch 16 \
+    --out weights/vio_mvit_v2_s.pt            # AMP + warmup→cosine + early-stop + class-weight
+uv run python -m train.eval_test --split test           # đo cross-domain trên VioPeru
+uv run python -m train.eval_threshold --manifest data/manifest.csv --split test  # tune ngưỡng kép
 ```
+
+**Kết quả** (MViT v2-S, crop-in-training, span 3s): val (4 bộ in-domain) **F1 0.969 / AUC 0.994**;
+test VioPeru (CCTV thật chưa train) clip-level **F1 0.73 / AUC 0.88**; verdict sliding-window
+**P≈0.90 R≈0.56** (recall trần ~0.60 do domain-gap — muốn vượt cần footage CCTV địa phương fine-tune).
 
 ## 2) Chạy demo end-to-end
 
@@ -127,23 +146,29 @@ nhãn, sweep (T_low, T_strong, K) → Precision/Recall/F1 để chọn ngưỡng
 | Tốc độ upload | `ANALYZE_GATE_EVERY` | 2 | chạy YOLO mỗi N frame khi phân tích video (tái dùng bbox) |
 | Lưu | `SAVE_PROB` | 0.50 | prob ≥ mức này mới lưu snapshot+clip |
 
-## ⚠️ Cần tối ưu sau này (hiện tại là baseline cho demo)
+## Trạng thái tối ưu (production)
 
-Training 8 epoch hiện tại chỉ là **baseline để test pipeline**. Khi tối ưu, theo thứ tự ưu tiên:
+**✅ Đã làm** (đợt MViT production):
+1. ✅ **Crop-to-person TRONG training** — `train/precompute_boxes.py` cache crop-box người (YOLO) →
+   `train/train_clip.py` crop y như inference. Hết train/serve skew không-gian.
+2. ✅ **Dữ liệu đa-domain** — 5 dataset (RLVS + RWF-2000 + SCVD + Surveillance Fight, VioPeru làm test).
+3. ✅ **Quy trình train chuẩn** — AMP, AdamW param-groups (LR thấp backbone/cao head), warmup→cosine,
+   early-stopping theo val-F1, class-weighted CE, augmentation (RRC/flip/color), tùy chọn mixup.
+4. ✅ **MULTI-SPAN × crop/full** — infer lấy MAX prob qua `WIN_SECONDS_LIST=[3,7]` × {crop-người,
+   full-frame} (`multispan_predict`). Sửa train/serve skew THỜI GIAN (16 frame liên tiếp ~0.5s →
+   trải đều nhiều giây) + bắt cả đánh nhau **nhanh lẫn chậm/đám đông** (vd fight dashcam ~7s mù với
+   span 3s) và **cảnh đông** (crop union ≈ cả khung → cần nhánh full-frame). VioPeru recall 0.34→**0.66**.
+6. ✅ **Căn `torch`/`torchvision`** (2.10.0 ↔ 0.25.0+cu128) — hết lỗi `nms`. Preprocess backbone-aware
+   (`BACKBONE_SPEC` + `frames_to_clip` dùng chung train+infer).
 
-1. **Crop-to-person TRONG training** (ưu tiên #1) — inference đã crop vùng người nhưng
-   [train/train_clip.py](train/train_clip.py) còn train trên **cả khung** → *train/serve skew*.
-   Train lại có crop (dùng `person_crop_box`) để khớp phân phối → prob sẽ lên thêm.
-2. **Thêm dữ liệu đúng domain** — fine-tune kèm **RWF-2000** (CCTV giám sát) hoặc clip CCTV thật
-   của xã, không chỉ RLVS (street fight cận cảnh).
-3. **Tối ưu quy trình train** — augmentation không-gian (random crop/flip/color), LR schedule
-   (cosine + warmup, LR thấp cho backbone), early-stopping thay vì cố định 8 epoch, mixup/cutmix clip.
-4. **Nhận diện vũ khí (súng/dao)** — r2plus1d chỉ bắt *chuyển động*, mù với **súng tĩnh** (vd cướp
-   cửa hàng tiện lợi). Cần train thêm YOLO trên dataset vũ khí (Sohas/Roboflow) làm đường cảnh báo song song.
-5. **GPU/throughput** — batch nhiều cửa sổ qua classifier engine khi có >1 camera; decode bằng NVDEC
-   thay cho cv2 CPU (bỏ nghẽn decode trong analyze).
-6. **Kỹ thuật** — căn chỉnh phiên bản `torch`/`torchvision` cho khớp (đang lệch 2.10/0.26, warning lúc
-   import); làm overlay 3 mức (Bình thường / Nghi ngờ / Bạo lực) cho khớp verdict, hết mâu thuẫn hiển thị.
+**⏳ Còn lại (ưu tiên):**
+- **Footage CCTV địa phương (Như Quỳnh)** — recall cross-domain trần ~0.60 trên VioPeru; fine-tune
+  thêm clip thật của xã là cách hiệu quả nhất để vượt (VioPeru hiện giữ làm test, không train).
+- **Nhận diện vũ khí (súng/dao)** — classifier chỉ bắt *chuyển động*, mù với **súng tĩnh**. Cần YOLO
+  vũ khí (Sohas/Roboflow) làm đường cảnh báo song song (đã chủ động loại SCVD-Weaponized khỏi train).
+- **GPU/throughput** — MViT KHÔNG ra TRT được (op SequenceAt…); đang torch-FP16. Có thể thử torch.compile /
+  batch nhiều cửa sổ; decode NVDEC thay cv2-CPU (đang nghẽn decode khi analyze nhiều video).
+- **Overlay 3 mức** (Bình thường / Nghi ngờ / Bạo lực) cho khớp verdict ngưỡng kép.
 
 ## Pháp lý
 Giám sát công + xử lý hình ảnh người dân → **Nghị định 13/2023/NĐ-CP** áp dụng. Đã có:

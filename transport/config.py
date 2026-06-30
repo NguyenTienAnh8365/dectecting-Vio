@@ -79,17 +79,33 @@ MIN_PERSONS = _int("MIN_PERSONS", 2)
 # Phân tích video upload: chỉ chạy YOLO mỗi N frame (tái dùng bbox cho overlay giữa các lần)
 # → giảm số lần infer gate, nhanh hơn. Vẫn ép chạy gate đúng frame quyết định cửa sổ để
 # đếm người chính xác. Tăng lên 3-4 nếu cần nhanh hơn nữa (bbox trễ tối đa N frame).
-ANALYZE_GATE_EVERY = _int("ANALYZE_GATE_EVERY", 2)
+ANALYZE_GATE_EVERY = _int("ANALYZE_GATE_EVERY", 3)
 
 # --- Classifier clip-level --------------------------------------------------
-VIO_BACKBONE = os.getenv("VIO_BACKBONE", "r2plus1d_18")  # torchvision.models.video
+VIO_BACKBONE = os.getenv("VIO_BACKBONE", "mvit_v2_s")  # torchvision.models.video (đã đổi từ r2plus1d_18)
 VIO_ENGINE = os.getenv("VIO_ENGINE", "")  # .engine TensorRT FP16 (ưu tiên nếu có) → full-TRT
 VIO_CKPT = os.getenv("VIO_CKPT", "weights/vio_r2plus1d.pt")  # rỗng/không tồn tại → dummy mode
 VIO_DEVICE = os.getenv("VIO_DEVICE", "0")
 VIO_HALF = os.getenv("VIO_HALF", "1") == "1"
-WIN_LEN = _int("WIN_LEN", 16)        # số frame mỗi clip
-WIN_STRIDE = _int("WIN_STRIDE", 8)   # phân loại lại mỗi N frame mới (cửa sổ trượt)
-CLIP_SIZE = _int("CLIP_SIZE", 112)   # cạnh ảnh đưa vào model (r2plus1d/mc3 = 112)
+WIN_LEN = _int("WIN_LEN", 16)        # số frame ĐƯA VÀO model (mvit CỐ ĐỊNH 16)
+WIN_STRIDE = _int("WIN_STRIDE", 16)  # phân loại lại mỗi N frame mới (multispan đã phủ 3-7s → thưa được)
+# Span THỜI GIAN của 1 cửa sổ phân loại. Training lấy 16 frame TRẢI ĐỀU cả clip (~vài giây);
+# nếu infer lấy 16 frame LIÊN TIẾP (ở fps gốc chỉ ~0.5s) thì lệch train/serve về thời gian →
+# bỏ sót (đo trên VioPeru: recall 0.26 khi span 0.5s → 0.56 khi span ~3s). Nên: buffer
+# round(WIN_SECONDS*fps) frame rồi lấy đều 16 frame. WIN_SECONDS≈3s khớp độ dài clip RLVS/RWF.
+# MULTI-SPAN: phân loại ở NHIỀU span rồi lấy MAX (bắt cả đánh nhau nhanh ~3s lẫn chậm/đám đông ~7s;
+# 1 span cố định không kham cả hai — vd fight dashcam diễn ra ~7s thì span 3s cho prob ~0). Buffer =
+# span LỚN NHẤT. Đánh đổi: trễ verdict đầu = span lớn nhất (vài giây) — chấp nhận được với cảnh báo bạo lực.
+WIN_SECONDS_LIST = [float(x) for x in os.getenv("WIN_SECONDS_LIST", "3.0,7.0").split(",")]
+WIN_SECONDS = max(WIN_SECONDS_LIST)  # span lớn nhất (kích thước buffer)
+GRAB_FPS = _int("GRAB_FPS", 12)      # fps luồng live (grabber) — để quy span ra số frame
+WIN_SPAN = max(WIN_LEN, round(WIN_SECONDS * GRAB_FPS))  # số frame buffer ở classifier live
+# Cạnh ảnh đưa vào model — mặc định SUY theo backbone (CNN video=112, mvit/transformer=224) để
+# train/infer/engine không lệch. Nguồn chân lý là BACKBONE_SPEC ở transport/model.py; map dưới chỉ
+# để default (tránh import vòng config↔model). Env CLIP_SIZE vẫn override nếu cần.
+_DEFAULT_SIZE = {"r2plus1d_18": 112, "mc3_18": 112, "r3d_18": 112,
+                 "s3d": 224, "mvit_v1_b": 224, "mvit_v2_s": 224}
+CLIP_SIZE = _int("CLIP_SIZE", _DEFAULT_SIZE.get(VIO_BACKBONE, 112))
 # Cắt quanh vùng người (union bbox YOLO) TRƯỚC khi đưa vào classifier → hành động bạo lực
 # to gần kín khung như RLVS, bù domain gap với CCTV góc rộng (người nhỏ, co về 112 mất tín
 # hiệu). Tắt bằng CROP_TO_PERSON=0. CROP_PAD = phần đệm quanh union (tỉ lệ cạnh).

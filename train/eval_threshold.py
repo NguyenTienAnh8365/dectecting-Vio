@@ -22,6 +22,7 @@ phỏng đầy đủ điều kiện MIN_PERSONS như chạy thật.
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import json
 import os
@@ -29,10 +30,17 @@ import os
 import cv2
 
 from transport import config
-from transport.model import VioModel
-from train.train_clip import label_of
+from transport.model import VioModel, even_indices
 
 _EXTS = ("*.mp4", "*.avi", "*.mov", "*.mpg", "*.mpeg")
+
+
+def label_of(path: str) -> int:
+    """Nhãn từ đường dẫn (chỉ cho chế độ --data; --manifest đã có nhãn sẵn)."""
+    p = path.lower()
+    neg = ("non" in p) or ("normal" in p)
+    pos = ("fight" in p) or ("viol" in p)
+    return 1 if (pos and not neg) else 0
 
 
 def _list_videos(data: str) -> list[str]:
@@ -42,22 +50,36 @@ def _list_videos(data: str) -> list[str]:
     return sorted(out)
 
 
-def probe_video(path: str, model: VioModel, gate=None) -> list[dict]:
-    """Trượt cửa sổ WIN_LEN mỗi WIN_STRIDE frame → [{prob, persons}] cho từng cửa sổ."""
+def probe_video(path: str, model: VioModel, gate=None, crop_box=None) -> list[dict]:
+    """Trượt cửa sổ WIN_LEN mỗi WIN_STRIDE frame → [{prob, persons}] cho từng cửa sổ.
+
+    crop_box=(x1,y1,x2,y2): crop vùng người (khớp infer/train). None = cả khung.
+    """
     cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 12.0
+    span = max(config.WIN_LEN, round(config.WIN_SECONDS * fps))  # buffer span thời gian → lấy đều 16
     win: list = []
     since, out = 0, []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        if crop_box:
+            x1, y1, x2, y2 = crop_box
+            frame = frame[y1:y2, x1:x2]
         win.append(frame)
-        if len(win) > config.WIN_LEN:
+        if len(win) > span:
             win.pop(0)
         since += 1
-        if len(win) == config.WIN_LEN and since >= config.WIN_STRIDE:
+        if len(win) >= config.WIN_LEN and since >= config.WIN_STRIDE:
             since = 0
-            prob = model.predict(list(win))
+            # MULTI-SPAN: max prob qua các span (frames đã pre-crop theo crop_box cả-clip).
+            n = len(win)
+            prob = 0.0
+            for sf in sorted({min(max(round(s * fps), config.WIN_LEN), n) for s in config.WIN_SECONDS_LIST}):
+                seg = win[n - sf:]
+                sel = even_indices(len(seg), config.WIN_LEN)
+                prob = max(prob, model.predict([seg[i] for i in sel]))
             persons = config.MIN_PERSONS  # mặc định coi như đủ người (gate tắt)
             if gate is not None:
                 res = gate.predict(frame, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
@@ -71,7 +93,17 @@ def probe_video(path: str, model: VioModel, gate=None) -> list[dict]:
     return out
 
 
-def build_cache(data: str, limit: int, use_gate: bool) -> dict:
+def _rows_from_manifest(manifest: str, split: str) -> list[tuple[str, int]]:
+    root = os.path.join(os.path.dirname(__file__), os.pardir)
+    out = []
+    with open(manifest, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r["split"] == split:
+                out.append((os.path.join(root, r["path"]), int(r["label"])))
+    return out
+
+
+def build_cache(rows: list[tuple[str, int]], use_gate: bool, crop_boxes: dict) -> dict:
     model = VioModel()
     if model.dummy:
         raise SystemExit("[eval] model DUMMY (chưa có engine/ckpt) → prob=0, vô nghĩa. "
@@ -81,20 +113,19 @@ def build_cache(data: str, limit: int, use_gate: bool) -> dict:
         from ultralytics import YOLO
         gate = YOLO(config.GATE_MODEL)
 
-    vids = _list_videos(data)
-    if limit:  # cân bằng: lấy tối đa `limit` mỗi lớp để khỏi lệch
-        pos = [v for v in vids if label_of(v) == 1][:limit]
-        neg = [v for v in vids if label_of(v) == 0][:limit]
-        vids = pos + neg
-    print(f"[eval] {len(vids)} video, gate={'on' if use_gate else 'off'} → trích prob cửa sổ…")
-
+    root = os.path.join(os.path.dirname(__file__), os.pardir)
+    print(f"[eval] {len(rows)} video, gate={'on' if use_gate else 'off'}, "
+          f"crop={'on' if crop_boxes else 'off'} → trích prob cửa sổ…")
     cache = {"meta": {"win_len": config.WIN_LEN, "win_stride": config.WIN_STRIDE,
                       "min_persons": config.MIN_PERSONS, "gate": use_gate}, "videos": []}
-    for i, v in enumerate(vids, 1):
-        windows = probe_video(v, model, gate)
-        cache["videos"].append({"path": v, "label": label_of(v), "windows": windows})
-        if i % 10 == 0 or i == len(vids):
-            print(f"  {i}/{len(vids)}  {os.path.basename(v)} ({len(windows)} cửa sổ)")
+    for i, (path, label) in enumerate(rows, 1):
+        rel = os.path.relpath(path, root)
+        info = crop_boxes.get(rel) or {}
+        box = tuple(info["box"]) if info.get("box") else None
+        windows = probe_video(path, model, gate, crop_box=box)
+        cache["videos"].append({"path": path, "label": label, "windows": windows})
+        if i % 10 == 0 or i == len(rows):
+            print(f"  {i}/{len(rows)}  {os.path.basename(path)} ({len(windows)} cửa sổ)")
     return cache
 
 
@@ -150,9 +181,13 @@ def _grid(s: str) -> list[float]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", help="thư mục video có nhãn (RLVS/RWF). Bỏ qua nếu --sweep-only")
+    ap.add_argument("--data", help="thư mục video có nhãn (RLVS/RWF). Bỏ qua nếu --manifest/--sweep-only")
+    ap.add_argument("--manifest", help="dùng manifest.csv (ưu tiên hơn --data)")
+    ap.add_argument("--split", default="test", help="split của manifest (mặc định test=VioPeru)")
+    ap.add_argument("--crop-boxes", default="data/cache/crop_boxes.json",
+                    help="cache crop-to-person (khớp infer); rỗng = không crop")
     ap.add_argument("--cache", default="logs/probe.json", help="file cache prob cửa sổ")
-    ap.add_argument("--limit", type=int, default=0, help="tối đa N video mỗi lớp (0=tất cả)")
+    ap.add_argument("--limit", type=int, default=0, help="tối đa N video mỗi lớp (0=tất cả; chỉ --data)")
     ap.add_argument("--gate", action="store_true", help="chạy person-gate (mô phỏng MIN_PERSONS)")
     ap.add_argument("--sweep-only", action="store_true", help="chỉ đọc cache + quét, không infer")
     ap.add_argument("--lows", default="0.45,0.55,0.60,0.65,0.70", help="lưới T_low")
@@ -164,9 +199,21 @@ def main() -> None:
         with open(args.cache, encoding="utf-8") as f:
             cache = json.load(f)
     else:
-        if not args.data:
-            raise SystemExit("cần --data (hoặc --sweep-only để đọc cache có sẵn)")
-        cache = build_cache(args.data, args.limit, args.gate)
+        if args.manifest:
+            rows = _rows_from_manifest(args.manifest, args.split)
+        elif args.data:
+            vids = _list_videos(args.data)
+            if args.limit:
+                pos = [v for v in vids if label_of(v) == 1][:args.limit]
+                neg = [v for v in vids if label_of(v) == 0][:args.limit]
+                vids = pos + neg
+            rows = [(v, label_of(v)) for v in vids]
+        else:
+            raise SystemExit("cần --manifest hoặc --data (hoặc --sweep-only để đọc cache có sẵn)")
+        crop_boxes = {}
+        if args.crop_boxes and os.path.exists(args.crop_boxes):
+            crop_boxes = json.load(open(args.crop_boxes, encoding="utf-8"))
+        cache = build_cache(rows, args.gate, crop_boxes)
         os.makedirs(os.path.dirname(args.cache) or ".", exist_ok=True)
         with open(args.cache, "w", encoding="utf-8") as f:
             json.dump(cache, f)
