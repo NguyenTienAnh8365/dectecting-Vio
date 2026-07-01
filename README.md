@@ -4,17 +4,22 @@ Phát hiện hành vi **gây gổ / xô đẩy / đánh nhau** từ camera, **s�
 snapshot/clip** cho CA xã xác nhận và có mặt kịp thời. Human-in-the-loop: hệ thống là
 **decision-support**, người trực gật đầu cuối cùng — KHÔNG tự động điều người.
 
-Tái dùng tầng transport (Redis Streams + YOLO + reliability) của dự án **Remote Sensing**.
+Camera nối **trực tiếp** vào dashboard.app — 1 tiến trình duy nhất, không qua message bus.
 Khác biệt cốt lõi: bài toán này **temporal (clip-level)**, không per-frame → thêm 1 stage
-**stateful per-camera** (cửa sổ trượt + 3D-CNN).
+**stateful per-camera** (cửa sổ trượt + video transformer).
+
+> Bản đầu dùng Redis Streams (kế thừa từ dự án Remote Sensing — nhiều worker stateless chia 1
+> hàng đợi). Đã bỏ hẳn: với vài camera IP nối thẳng 1 server AI, Redis chỉ tổ thêm JPEG
+> encode/decode + round-trip mỗi frame, và khiến backlog tích lũy thay vì tự bỏ frame cũ khi xử
+> lý không kịp (xem lịch sử git + docstring [transport/live.py](transport/live.py)).
 
 ## Hai luồng
 
-**1. Live (RTSP/camera):**
+**1. Live (RTSP/camera) — nhúng trong dashboard.app:**
 ```
-RTSP/clip ─grabber─> [vio:frames:ready] ─gate (YOLO person, stateless, group)─>
-  [vio:frames:gated] ─classifier (STATEFUL per-camera, cửa sổ 16f, 3D-CNN)─>
-    [vio:results] ─dashboard (ngưỡng kép + cooldown)─> 🔔 SSE + snapshot/clip (disk)
+RTSP/clip ─capture thread (1/camera, giữ đúng frame mới nhất)─>
+  gate (YOLO person) ─classifier (STATEFUL per-camera, cửa sổ 16f, video transformer)─>
+    callback trực tiếp trong process ─dashboard (ngưỡng kép + cooldown)─> 🔔 SSE + snapshot/clip (disk)
 ```
 
 **2. Upload (tải video lên xem lại có detection):**
@@ -23,15 +28,13 @@ video upload ─> dashboard /api/upload ─> analyze.py (YOLO gate + classifier)
   MP4 H.264 có overlay bbox + % bạo lực + verdict ─> xem lại trên dashboard
 ```
 
-| Stage | File | Tái dùng từ RS | Vai trò |
-|---|---|---|---|
-| grabber | [transport/grabber.py](transport/grabber.py) | producer.py | clip/RTSP → frame stream |
-| person-gate | [transport/gate.py](transport/gate.py) | worker.py | YOLO đếm người + bbox (stateless, group) |
-| classifier | [transport/classifier.py](transport/classifier.py) | 🆕 mới | cửa sổ trượt per-camera → prob bạo lực |
-| model | [transport/model.py](transport/model.py) | 🆕 mới | torchvision video (r2plus1d_18) + TensorRT runner |
-| analyze | [transport/analyze.py](transport/analyze.py) | 🆕 mới | phân tích offline 1 video upload → MP4 có overlay |
-| dashboard | [dashboard/app.py](dashboard/app.py) | consumer.py | ngưỡng kép + cooldown → alert + SSE + upload |
-| store | [transport/store.py](transport/store.py) | storage.py (MinIO→disk) | snapshot + clip bằng chứng |
+| Stage | File | Vai trò |
+|---|---|---|
+| live (camera) | [transport/live.py](transport/live.py) | capture thread/camera + gate + classifier, nhúng trong dashboard |
+| model | [transport/model.py](transport/model.py) | torchvision video (MViT v2-S) + TensorRT runner |
+| analyze | [transport/analyze.py](transport/analyze.py) | phân tích offline 1 video upload → MP4 có overlay |
+| dashboard | [dashboard/app.py](dashboard/app.py) | chạy live.py + ngưỡng kép/cooldown → alert + SSE + upload |
+| store | [transport/store.py](transport/store.py) | snapshot + clip bằng chứng (disk) |
 
 ## Hai mạng "cạnh nhau" — kế thừa checkpoint, KHÔNG train từ đầu
 
@@ -51,9 +54,7 @@ video upload ─> dashboard /api/upload ─> analyze.py (YOLO gate + classifier)
 
 ```bash
 uv venv && uv pip install -r requirements.txt   # .venv + deps (torch cu128 cho Blackwell)
-cp .env.example .env           # sửa REDIS_PASSWORD, trỏ VIO_ENGINE/GATE_MODEL nếu dùng engine
-docker compose up -d           # Redis ở cổng 6381
-uv run python -m transport.init_streams
+cp .env.example .env           # điền LIVE_CAMS, trỏ VIO_ENGINE/GATE_MODEL nếu dùng engine
 ```
 
 > Chưa có checkpoint/engine? Pipeline vẫn chạy thông ở **dummy mode** (prob=0, không bắn
@@ -88,31 +89,31 @@ test VioPeru (CCTV thật chưa train) clip-level **F1 0.73 / AUC 0.88**; verdic
 ## 2) Chạy demo end-to-end
 
 ```bash
-docker compose up -d
-PY="uv run python" scripts/run_demo.sh data/people_test.mp4 cam1   # dựng 4 tiến trình + đẩy clip loop
+PY="uv run python" scripts/run_demo.sh data/people_test.mp4 cam1   # dashboard.app + đẩy clip loop
 # mở http://<server>:8080
 ```
 
-Hoặc chạy tay từng tiến trình (mỗi cái 1 terminal):
+Hoặc chạy tay (1 tiến trình duy nhất — camera nối trực tiếp vào dashboard):
 ```bash
-uv run python -m transport.init_streams
-uv run python -m transport.gate
-uv run python -m transport.classifier
-uv run python -m dashboard.app
-uv run python -m transport.grabber --src data/people_test.mp4 --camera cam1 --fps 12 --loop
+LIVE_CAMS="cam1=data/people_test.mp4" LIVE_LOOP=1 uv run python -m dashboard.app
 ```
 
 **Chỉ dashboard (upload + xem lại, không cần camera live):**
 ```bash
-docker compose up -d && uv run python -m dashboard.app   # kéo video vào ô upload
+uv run python -m dashboard.app   # LIVE_CAMS rỗng → kéo video vào ô upload
 ```
 
-**Camera thật** chỉ đổi `--src`, không sửa code:
+**Camera thật** — nhiều camera cách nhau `;`, không sửa code:
 ```bash
-uv run python -m transport.grabber --src "rtsp://user:pass@ip:554/Streaming/Channels/101" --camera cam1 --fps 12
+LIVE_CAMS="cam1=rtsp://user:pass@ip:554/Streaming/Channels/101;cam2=rtsp://..." uv run python -m dashboard.app
 ```
 
-Dừng nền: `pkill -f 'transport\.|dashboard\.app'`
+**Test nhanh riêng pipeline camera** (in kết quả ra console, không cần dashboard):
+```bash
+uv run python -m transport.live --cam cam1=data/people_test.mp4 --loop
+```
+
+Dừng nền: `pkill -f 'dashboard\.app'`
 
 ## Logic phát hiện (các quyết định cốt lõi)
 
@@ -176,6 +177,6 @@ TTL tự xóa media (`MEDIA_TTL_DAYS`, mặc định 3 ngày) + human-in-the-loo
 Cần bổ sung cho production: phân quyền truy cập chi tiết, policy lưu trữ/xóa, nhật ký truy cập.
 
 ## Đường lên edge (sau demo)
-Stage **gate** và **classifier** stateless về contract (chỉ giao tiếp qua Redis) → bê thẳng lên Jetson:
-export model TensorRT (gate `yolo … format=engine`; classifier ONNX→TRT — đã có), giữ nguyên
-stream/dashboard. Server Blackwell làm "lò luyện" fine-tune + distill.
+`transport/live.py` không phụ thuộc hạ tầng server (không Redis/message bus) → bê thẳng lên
+Jetson: export model TensorRT (gate `yolo … format=engine`; classifier ONNX→TRT — đã có), giữ
+nguyên `dashboard/app.py`. Server Blackwell làm "lò luyện" fine-tune + distill.

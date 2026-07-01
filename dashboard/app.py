@@ -1,12 +1,15 @@
-"""Dashboard — tiêu thụ vio:results, ráp logic ALERT (k-of-n + cooldown), đẩy SSE realtime.
+"""Dashboard — nhúng thẳng pipeline camera live (transport.live) + ráp logic ALERT
+(k-of-n + cooldown) + đẩy SSE realtime. KHÔNG qua Redis (xem transport/live.py) — camera nối
+trực tiếp vào tiến trình này.
 
-Đây là "BE" của pipeline (fork consumer.py): smoothing chống false-positive + cooldown
-chống spam là việc của tầng này, không phải classifier. Human-in-the-loop: dashboard chỉ
-SÁNG ĐÈN + hiện snapshot/clip để trực ban xác nhận, KHÔNG tự động điều người.
+Đây là "BE" của pipeline: smoothing chống false-positive + cooldown chống spam là việc của
+tầng này, không phải classifier. Human-in-the-loop: dashboard chỉ SÁNG ĐÈN + hiện snapshot/clip
+để trực ban xác nhận, KHÔNG tự động điều người.
 
 Chạy:
-  python -m dashboard.app
+  LIVE_CAMS="cam1=rtsp://user:pass@ip/stream" python -m dashboard.app
   # rồi mở http://<server>:8080
+  # LIVE_CAMS rỗng/không set → chỉ chức năng upload, không có camera live.
 """
 from __future__ import annotations
 
@@ -23,13 +26,12 @@ from datetime import datetime
 
 import base64
 
-import redis
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from transport import config, envelope
+from transport import config, live
 
 app = FastAPI(title="Phát hiện bạo lực — Như Quỳnh")
 
@@ -99,7 +101,7 @@ def _job_public(j: dict) -> dict:
     return {k: j.get(k) for k in ("id", "name", "status", "progress", "result",
                                   "video_url", "poster_url", "error", "time")}
 
-# --- Trạng thái chia sẻ giữa thread Redis và web ---------------------------
+# --- Trạng thái chia sẻ giữa thread camera live và web ----------------------
 _state_lock = threading.Lock()
 _live: dict[str, dict] = {}                 # camera_id → {prob, num_persons, ts}
 _alerts: deque = deque(maxlen=100)          # alert gần nhất (mới ở đầu)
@@ -111,7 +113,7 @@ _alert_seq = 0
 
 
 def _broadcast(event: dict) -> None:
-    """Đẩy event tới mọi client SSE (gọi từ thread Redis → schedule lên event loop)."""
+    """Đẩy event tới mọi client SSE (gọi từ thread camera live → schedule lên event loop)."""
     if _loop is None:
         return
     data = json.dumps(event, ensure_ascii=False)
@@ -123,72 +125,54 @@ def _media_url(key: str) -> str:
     return f"/media/{key}" if key else ""
 
 
-def _consume_loop() -> None:
-    """Thread: XREADGROUP vio:results → cập nhật live + áp k-of-n/cooldown → alert."""
+def _handle_live_result(camera_id: str, result: dict) -> None:
+    """Callback gọi TRỰC TIẾP từ thread camera (transport.live) mỗi lần có kết quả classify mới
+    — cập nhật live + áp k-of-n/cooldown → alert. Cùng process, không qua message bus."""
     global _alert_seq
-    r = redis.from_url(config.REDIS_URL)
-    name = "dash-1"
-    print(f"[dash] consuming {config.RES_STREAM} group {config.CG_DASH}")
-    while True:
-        try:
-            resp = r.xreadgroup(
-                groupname=config.CG_DASH, consumername=name,
-                streams={config.RES_STREAM: ">"}, count=config.READ_COUNT, block=500,
-            )
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
-            time.sleep(0.5)
-            continue
-        except redis.exceptions.ResponseError as e:
-            if "NOGROUP" in str(e):
-                try:
-                    r.xgroup_create(config.RES_STREAM, config.CG_DASH, id="$", mkstream=True)
-                except redis.exceptions.ResponseError:
-                    pass
-                continue
-            raise
-        if not resp:
-            continue
+    prob = result["prob"]
+    now = time.time()
+    enough_persons = result["num_persons"] >= config.MIN_PERSONS
+    positive = prob >= config.VIO_THRESHOLD and enough_persons
+    strong = prob >= config.VIO_THRESHOLD_STRONG and enough_persons
 
-        _, entries = resp[0]
-        for eid, fields in entries:
-            res = envelope.parse_res(fields)
-            cam = res["camera_id"]
-            d = res["result"]
-            prob = d["prob"]
-            now = time.time()
-            enough_persons = d["num_persons"] >= config.MIN_PERSONS
-            positive = prob >= config.VIO_THRESHOLD and enough_persons
-            strong = prob >= config.VIO_THRESHOLD_STRONG and enough_persons
+    with _state_lock:
+        _live[camera_id] = {"prob": prob, "num_persons": result["num_persons"], "ts": result["ts"]}
+        w = _windows[camera_id]
+        w.append(1 if positive else 0)
+        # Alert khi: đủ K/N cửa sổ dương (kéo dài) HOẶC 1 cửa sổ mạnh (chớp nhoáng, không để
+        # k-of-n nuốt mất). Cả hai vẫn tôn trọng cooldown chống spam.
+        fire = ((sum(w) >= config.ALERT_K or strong)
+                and now - _last_alert.get(camera_id, 0) >= config.COOLDOWN_S)
+        alert = None
+        if fire:
+            _last_alert[camera_id] = now
+            _alert_seq += 1
+            alert = {
+                "id": _alert_seq,
+                "camera_id": camera_id,
+                "time": datetime.fromtimestamp(result["ts"]).strftime("%H:%M:%S %d/%m"),
+                "prob": prob,
+                "num_persons": result["num_persons"],
+                "snapshot_url": _media_url(result.get("snapshot_key", "")),
+                "clip_url": _media_url(result.get("clip_key", "")),
+            }
+            _alerts.appendleft(alert)
 
-            with _state_lock:
-                _live[cam] = {"prob": prob, "num_persons": d["num_persons"], "ts": d["ts"]}
-                w = _windows[cam]
-                w.append(1 if positive else 0)
-                # Alert khi: đủ K/N cửa sổ dương (kéo dài) HOẶC 1 cửa sổ mạnh (chớp nhoáng,
-                # không để k-of-n nuốt mất). Cả hai vẫn tôn trọng cooldown chống spam.
-                fire = ((sum(w) >= config.ALERT_K or strong)
-                        and now - _last_alert.get(cam, 0) >= config.COOLDOWN_S)
-                alert = None
-                if fire:
-                    _last_alert[cam] = now
-                    _alert_seq += 1
-                    alert = {
-                        "id": _alert_seq,
-                        "camera_id": cam,
-                        "time": datetime.fromtimestamp(d["ts"]).strftime("%H:%M:%S %d/%m"),
-                        "prob": prob,
-                        "num_persons": d["num_persons"],
-                        "snapshot_url": _media_url(d.get("snapshot_key", "")),
-                        "clip_url": _media_url(d.get("clip_key", "")),
-                    }
-                    _alerts.appendleft(alert)
+    _broadcast({"type": "live", "camera_id": camera_id,
+                "prob": prob, "num_persons": result["num_persons"]})
+    if alert:
+        print(f"[dash] 🚨 ALERT {camera_id} prob={prob:.2f} persons={result['num_persons']}")
+        _broadcast({"type": "alert", "alert": alert})
 
-            _broadcast({"type": "live", "camera_id": cam,
-                        "prob": prob, "num_persons": d["num_persons"]})
-            if alert:
-                print(f"[dash] 🚨 ALERT {cam} prob={prob:.2f} persons={d['num_persons']}")
-                _broadcast({"type": "alert", "alert": alert})
-            r.xack(config.RES_STREAM, config.CG_DASH, eid)
+
+def _live_cams_loop() -> None:
+    """Thread: nạp model + chạy camera live (transport.live), gọi _handle_live_result mỗi kết
+    quả. Không có LIVE_CAMS → bỏ qua, dashboard vẫn chạy được chức năng upload."""
+    cams = live.parse_cams_env(config.LIVE_CAMS)
+    if not cams:
+        print("[dash] LIVE_CAMS trống — không chạy camera live (chỉ upload).")
+        return
+    live.run_live(cams, _handle_live_result, loop=config.LIVE_LOOP)
 
 
 def _cleanup_loop() -> None:
@@ -208,7 +192,7 @@ async def _startup() -> None:
     _loop = asyncio.get_running_loop()
     # Gắn filter SAU khi uvicorn cấu hình logging (dictConfig lúc khởi động) → không bị reset.
     logging.getLogger("uvicorn.access").addFilter(_QuietStaticAccess())
-    threading.Thread(target=_consume_loop, daemon=True).start()
+    threading.Thread(target=_live_cams_loop, daemon=True, name="live-cams").start()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 

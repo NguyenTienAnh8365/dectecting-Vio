@@ -1,9 +1,7 @@
-# Violence detection demo — tái dùng stack transport của Remote Sensing.
+# Violence detection — camera nối trực tiếp về AI server (transport/live.py, không qua Redis).
 # torch/torchvision: classifier clip-level (torchvision.models.video) + YOLO person-gate.
-msgpack==1.2.1
 numpy==2.5.0
 opencv-python==4.13.0.92
-redis==8.0.1
 torch==2.12.1
 torchvision==0.27.1
 ultralytics==8.4.82

@@ -1,7 +1,7 @@
 """Phân tích offline 1 video upload → xuất video H.264 có overlay detection + verdict.
 
-Khác pipeline live (Redis streaming): đây là đường "tải video lên → infer → xem lại có
-detection". Tái dùng đúng 2 model engine: YOLO gate (đếm/định vị người) + VioModel
+Khác pipeline live (transport/live.py, camera nối trực tiếp): đây là đường "tải video lên →
+infer → xem lại có detection". Tái dùng đúng 2 model engine: YOLO gate (đếm/định vị người) + VioModel
 (clip-level, TensorRT FP16). Xuất MP4 H.264 (imageio-ffmpeg) để trình duyệt phát được —
 opencv mp4v KHÔNG phát trên web.
 """

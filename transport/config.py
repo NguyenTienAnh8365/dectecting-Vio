@@ -1,11 +1,10 @@
 """Cấu hình pipeline violence detection — đọc từ env, default chạy được ngay.
 
-Fork từ Remote Sensing/transport/config.py. Khác biệt cốt lõi: bài toán này TEMPORAL
-(clip-level), không per-frame. Pipeline 3 chặng:
+Khác biệt cốt lõi: bài toán này TEMPORAL (clip-level), không per-frame. Camera nối TRỰC TIẾP
+vào dashboard.app (transport/live.py, KHÔNG qua message bus — xem live.py để hiểu lý do):
 
-  grabber → [REQ_STREAM] → gate (YOLO person, stateless, consumer group)
-          → [GATED_STREAM] → classifier (STATEFUL per-camera, in-order, 1 process)
-          → [RES_STREAM] → dashboard (k-of-n + cooldown → alert + SSE)
+  camera (LIVE_CAMS) → gate (YOLO person) → classifier (STATEFUL per-camera, cửa sổ trượt)
+                     → dashboard (k-of-n + cooldown → alert + SSE), CÙNG 1 tiến trình.
 """
 from __future__ import annotations
 
@@ -41,29 +40,13 @@ def _float(name: str, default: float) -> float:
     return float(os.getenv(name, default))
 
 
-# --- Kết nối ---------------------------------------------------------------
-REDIS_URL = os.getenv("REDIS_URL", "redis://:changeme@localhost:6381/0")
-
-# --- Streams / consumer group ----------------------------------------------
-REQ_STREAM = os.getenv("REQ_STREAM", "vio:frames:ready")     # grabber → gate
-GATED_STREAM = os.getenv("GATED_STREAM", "vio:frames:gated")  # gate → classifier
-RES_STREAM = os.getenv("RES_STREAM", "vio:results")           # classifier → dashboard
-DLQ_STREAM = os.getenv("DLQ_STREAM", "vio:dead-letter")
-CG_GATE = os.getenv("CG_GATE", "cg:gate")
-CG_CLS = os.getenv("CG_CLS", "cg:cls")
-CG_DASH = os.getenv("CG_DASH", "cg:dash")
-
-# --- Backpressure / batch (ring-buffer realtime, drop frame cũ) -------------
-REQ_MAXLEN = _int("REQ_MAXLEN", 2000)
-GATED_MAXLEN = _int("GATED_MAXLEN", 2000)
-RES_MAXLEN = _int("RES_MAXLEN", 4000)
-READ_COUNT = _int("READ_COUNT", 16)
-READ_BLOCK_MS = _int("READ_BLOCK_MS", 20)
-CLAIM_MIN_IDLE_MS = _int("CLAIM_MIN_IDLE_MS", 30000)
-
-# --- Độ tin cậy: idempotency + dead-letter ---------------------------------
-DONE_TTL_S = _int("DONE_TTL_S", 120)
-MAX_DELIVERIES = _int("MAX_DELIVERIES", 5)
+# --- Camera live -------------------------------------------------------------
+# "cam1=rtsp://user:pass@ip/stream;cam2=data/fight.mp4" — dashboard.app tự chạy transport.live
+# nhúng trong tiến trình (thread), rỗng = không có camera live (chỉ upload). Xem transport/live.py.
+LIVE_CAMS = os.getenv("LIVE_CAMS", "")
+# Nguồn FILE hết clip thì tua lại (demo bằng 1 clip lặp vô hạn) — camera rtsp/http bỏ qua cờ này
+# (luôn tự nhịp theo camera, không có khái niệm "hết clip").
+LIVE_LOOP = os.getenv("LIVE_LOOP", "0") == "1"
 
 # --- Person gate (YOLO) -----------------------------------------------------
 GATE_MODEL = os.getenv("GATE_MODEL", "yolo11n.pt")  # nhẹ, tự tải; đổi yolo26x nếu cần chính xác
@@ -74,11 +57,8 @@ GATE_HALF = os.getenv("GATE_HALF", "1") == "1"
 # ultralytics mới bỏ tham số predict 'half' → dùng 'quantize' (16=FP16, None=FP32). Map sẵn.
 GATE_QUANTIZE = 16 if GATE_HALF else None
 PERSON_CLASS = _int("PERSON_CLASS", 0)  # COCO 'person'
-# yolo26x.engine build BATCH TĨNH (=1) → gửi nhiều ảnh vào 1 lần predict sẽ crash AssertionError
-# khi backlog dồn về (đo thực tế 2026-07-01: 809 frame tồn đọng → batch=5 crash). gate.py chia
-# process_batch thành từng nhóm ≤ GATE_BATCH_SIZE để không bao giờ vượt batch engine. Đổi số này
-# NẾU rebuild engine với batch lớn hơn/dynamic (không tự đổi code).
-GATE_BATCH_SIZE = _int("GATE_BATCH_SIZE", 1)
+# yolo26x.engine build BATCH TĨNH (=1) — transport/live.py luôn gọi predict() đúng 1 ảnh/lần nên
+# tự nhiên không bao giờ vượt batch engine (không cần chunk như bản Redis cũ).
 # Số người tối thiểu trong cửa sổ để alert được kích hoạt (gate alert, không gate frame).
 MIN_PERSONS = _int("MIN_PERSONS", 2)
 # Phân tích video upload: chỉ chạy YOLO mỗi N frame (tái dùng bbox cho overlay giữa các lần)

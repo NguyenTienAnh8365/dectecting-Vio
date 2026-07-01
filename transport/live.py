@@ -1,28 +1,31 @@
-"""Pipeline live IN-PROCESS — camera → gate → classifier CÙNG 1 tiến trình, KHÔNG qua Redis.
+"""Pipeline live camera — TOÀN BỘ trong 1 tiến trình, KHÔNG qua Redis.
 
-Redis 3 chặng cũ (grabber→gate→classifier qua vio:frames:ready/gated, xem grabber.py/gate.py/
-classifier.py) là kế thừa từ dự án viễn thám: nhiều worker STATELESS chia nhau 1 hàng đợi ảnh
-rời rạc, thứ tự không quan trọng. Dự án này camera IP kết nối TRỰC TIẾP về 1 server AI (vài
-camera, không phải fleet lớn) — đi qua Redis chỉ tổ thêm JPEG encode/decode + round-trip mạng
-mỗi frame, VÀ khiến backlog TÍCH LŨY (MAXLEN giữ nguyên ở đáy) thay vì tự bỏ frame cũ khi xử
-lý không kịp camera (đo thực tế 2026-07-01: 30fps, 1 gate+1 classifier worker → độ trễ tăng dần
-15s→26s trong 35s, không bao giờ bắt kịp).
+Trước đây có 2 tầng Redis: grabber→gate→classifier (frame relay, đã bỏ — xem git log) rồi
+classifier→dashboard (`vio:results`). Cả 2 đều là kế thừa từ dự án viễn thám: nhiều worker
+STATELESS chia nhau 1 hàng đợi ảnh rời rạc, thứ tự không quan trọng. Dự án này camera IP kết
+nối TRỰC TIẾP về 1 server AI (vài camera, không phải fleet lớn) — Redis chỉ tổ thêm JPEG
+encode/decode + round-trip mạng mỗi frame, VÀ khiến backlog TÍCH LŨY (MAXLEN giữ nguyên ở đáy)
+thay vì tự bỏ frame cũ khi xử lý không kịp camera (đo thực tế 2026-07-01: 30fps, 1 gate+1
+classifier worker qua Redis → độ trễ tăng dần 15s→26s trong 35s, không bao giờ bắt kịp).
 
-Ở đây: mỗi camera 1 thread capture giữ "ô nhớ" (FrameBox) đúng 1 frame MỚI NHẤT — không có
+Kiến trúc: mỗi camera 1 thread capture giữ "ô nhớ" (FrameBox) đúng 1 frame MỚI NHẤT — không có
 hàng đợi, frame cũ chưa kịp xử lý bị ghi đè thẳng (đúng tinh thần realtime: luôn ưu tiên hiện
 tại hơn lịch sử). 1 vòng lặp infer round-robin qua các camera, lấy frame mới nhất mỗi cam →
-gate (YOLO người, đúng 1 ảnh/lần — tự nhiên khớp batch tĩnh=1 của engine, không cần
-GATE_BATCH_SIZE chunking) → nạp cửa sổ trượt per-camera (CamWindow, tái dùng classifier.py) →
-đủ WIN_LEN/WIN_STRIDE thì classify (multispan) → XADD thẳng vio:results. Stream/dashboard
-KHÔNG đổi gì (envelope.build_res giữ nguyên định dạng) — chỉ chặng ingest+gate+classify bỏ Redis.
+gate (YOLO người, đúng 1 ảnh/lần — tự nhiên khớp batch tĩnh=1 của engine) → nạp cửa sổ trượt
+per-camera (CamWindow) → đủ WIN_LEN/WIN_STRIDE thì classify (multispan) → gọi thẳng callback
+`on_result(camera_id, result)` do CALLER cung cấp (dashboard.app gọi trực tiếp trong process
+của nó — không cần message bus vì cùng 1 server).
 
 Giới hạn đã biết: spans_frames (multispan_predict) suy ra SỐ FRAME từ WIN_SECONDS_LIST*GRAB_FPS
 (giả định buffer lấp đầy đúng nhịp GRAB_FPS). Nếu 1 server quá tải nhiều camera tới mức infer
 chậm hơn camera gửi, frame bị bỏ (mailbox ghi đè) khiến cửa sổ trải dài hơn WIN_SECONDS_LIST
-thực tế — chấp nhận được ở quy mô vài camera của dự án (gate+classify đã đo nhanh hơn nhiều so
-với budget WIN_STRIDE/GRAB_FPS), nhưng cần lưu ý nếu mở rộng số camera/1 server sau này.
+thực tế — chấp nhận được ở quy mô vài camera của dự án, nhưng cần lưu ý nếu mở rộng sau này.
 
-Dùng:
+Dùng (nhúng trong dashboard — xem dashboard/app.py):
+  cams = parse_cams_env(config.LIVE_CAMS)
+  threading.Thread(target=run_live, args=(cams, on_result), daemon=True).start()
+
+Dùng (CLI standalone, test nhanh không cần dashboard):
   python -m transport.live --cam cam1=data/fight.mp4 --loop
   python -m transport.live --cam cam1=rtsp://user:pass@ip/stream --cam cam2=rtsp://...
 """
@@ -33,15 +36,14 @@ import signal
 import statistics
 import threading
 import time
+from collections import deque
+from typing import Callable
 
 import cv2
 import numpy as np
-import redis
 import torch
 
-from . import config, envelope, grabber, store
-from .classifier import CamWindow, annotate
-from .gate import persons_from
+from . import config, store
 from .model import VioModel, even_indices, multispan_predict, quiet_ml_logs, suppress_native_logs
 
 _stop = False
@@ -50,7 +52,72 @@ _stop = False
 def _handle_sig(*_):
     global _stop
     _stop = True
-    grabber._stop = True  # _open_capture (tái dùng từ grabber.py) đọc cờ dừng của module đó
+
+
+def annotate(frame: np.ndarray, boxes: list, prob: float) -> np.ndarray:
+    """Vẽ bbox người + nhãn prob lên snapshot bằng chứng."""
+    img = frame.copy()
+    for (x, y, w, h) in boxes:
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+    cv2.putText(img, f"VIOLENCE {prob:.0%}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    return img
+
+
+def persons_from(result) -> list[list[int]]:
+    """Trả list bbox [x, y, w, h] (int) của các 'person'."""
+    out = []
+    boxes = result.boxes
+    if boxes is None:
+        return out
+    xywh = boxes.xywh.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    for (x, y, w, h), c in zip(xywh, cls):
+        if int(c) == config.PERSON_CLASS:
+            out.append([int(x - w / 2), int(y - h / 2), int(w), int(h)])
+    return out
+
+
+class CamWindow:
+    """Ring-buffer 1 camera: frame + meta cho cửa sổ trượt."""
+    def __init__(self):
+        # Buffer SPAN thời gian (WIN_SPAN = round(WIN_SECONDS*GRAB_FPS) frame) → lấy đều WIN_LEN=16
+        # frame lúc phân loại (khớp training). Tránh lệch train/serve về thời gian (xem config).
+        self.frames: deque = deque(maxlen=config.WIN_SPAN)
+        self.persons: deque = deque(maxlen=config.WIN_SPAN)
+        self.boxes: deque = deque(maxlen=config.WIN_SPAN)
+        self.boxes_last: list = []
+        self.since_last = 0
+        self.last_ts = 0.0
+        self.last_seq = 0
+
+
+def _is_live_src(src: str) -> bool:
+    """URL luồng (rtsp/http) → nguồn LIVE cần tự reconnect khi rớt, khác file clip tĩnh."""
+    return src.lower().startswith(("rtsp://", "rtsps://", "http://", "https://"))
+
+
+def _open_capture(src: str, is_live: bool, max_backoff: float = 30.0):
+    """Mở VideoCapture. Nguồn LIVE: retry backoff tăng dần (1s→30s) tới khi thành công hoặc
+    nhận tín hiệu dừng — mạng CCTV chập chờn/camera chưa sẵn sàng lúc khởi động không làm
+    capture chết hẳn. Nguồn FILE: thử 1 lần, lỗi thì trả None luôn (retry vô ích nếu sai
+    đường dẫn/file hỏng)."""
+    delay = 1.0
+    while True:
+        cap = cv2.VideoCapture(src)
+        if cap.isOpened():
+            return cap
+        cap.release()
+        if not is_live or _stop:
+            return None
+        print(f"[live] không mở được nguồn (thử lại sau {delay:.0f}s): {src}")
+        slept = 0.0
+        while slept < delay and not _stop:  # ngủ từng nhịp ngắn để dừng phản hồi nhanh
+            time.sleep(min(1.0, delay - slept))
+            slept += 1.0
+        if _stop:
+            return None
+        delay = min(delay * 2, max_backoff)
 
 
 class FrameBox:
@@ -87,12 +154,11 @@ class LiveCam:
 def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: FrameBox) -> None:
     """Đọc 1 nguồn liên tục, chỉ ghi vào FrameBox (không encode/không Redis).
 
-    Tái dùng nguyên bộ reconnect-với-backoff của grabber.py (_is_live_src/_open_capture) —
-    đã test riêng cho rớt mạng RTSP. Nguồn FILE vẫn throttle theo --fps (mô phỏng thời gian
-    thực khi demo bằng clip); nguồn LIVE để camera tự nhịp, không throttle.
+    Nguồn FILE throttle theo --fps (mô phỏng thời gian thực khi demo bằng clip); nguồn LIVE để
+    camera tự nhịp, không throttle. Tự reconnect với backoff khi nguồn LIVE rớt mạng.
     """
-    is_live = grabber._is_live_src(src)
-    cap = grabber._open_capture(src, is_live)
+    is_live = _is_live_src(src)
+    cap = _open_capture(src, is_live)
     if cap is None:
         if not _stop:
             print(f"[live {camera_id}] không mở được nguồn: {src}")
@@ -109,7 +175,7 @@ def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: Frame
             if is_live:
                 print(f"[live {camera_id}] mất kết nối, đang reconnect: {src}")
                 cap.release()
-                cap = grabber._open_capture(src, is_live)
+                cap = _open_capture(src, is_live)
                 if cap is None:  # chỉ None khi nhận tín hiệu dừng giữa lúc reconnect
                     break
                 continue
@@ -134,7 +200,8 @@ def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: Frame
     print(f"[live {camera_id}] capture dừng. frames={seq}")
 
 
-def _process_one(cam: LiveCam, gate_model, model, r, media) -> bool:
+def _process_one(cam: LiveCam, gate_model, model, on_result: Callable[[str, dict], None],
+                  media: store.MediaStore) -> bool:
     """Lấy frame mới nhất của 1 camera (nếu có) → gate → nạp cửa sổ → classify khi đủ stride.
 
     Trả False nếu camera chưa có frame mới (để vòng ngoài biết lúc nào nên ngủ, tránh busy-loop).
@@ -185,17 +252,17 @@ def _process_one(cam: LiveCam, gate_model, model, r, media) -> bool:
             "model": config.VIO_BACKBONE,
             "modelVersion": config.MODEL_VERSION,
         }
-        r.xadd(config.RES_STREAM, envelope.build_res(cam.id, result),
-               maxlen=config.RES_MAXLEN, approximate=True)
+        on_result(cam.id, result)
     return True
 
 
-def _run_infer_loop(cams: list[LiveCam], gate_model, model, r, media) -> None:
+def _run_infer_loop(cams: list[LiveCam], gate_model, model,
+                     on_result: Callable[[str, dict], None], media: store.MediaStore) -> None:
     total, last_log, last_empty_cache = 0, time.time(), time.time()
     while not _stop:
         did_work = False
         for cam in cams:
-            if _process_one(cam, gate_model, model, r, media):
+            if _process_one(cam, gate_model, model, on_result, media):
                 did_work = True
                 total += 1
 
@@ -212,11 +279,62 @@ def _run_infer_loop(cams: list[LiveCam], gate_model, model, r, media) -> None:
     print(f"[live] infer dừng. processed={total}")
 
 
+def load_models():
+    """Nạp YOLO gate + VioModel (1 lần) — dùng chung cho CLI standalone lẫn nhúng trong dashboard."""
+    quiet_ml_logs()
+    with suppress_native_logs():        # nuốt log TRT/ultralytics lúc nạp engine + warmup (1 lần)
+        from ultralytics import YOLO
+        gate_model = YOLO(config.GATE_MODEL, task="detect", verbose=False)
+        gate_model.predict(np.zeros((config.GATE_IMGSZ, config.GATE_IMGSZ, 3), np.uint8),
+                            device=config.GATE_DEVICE, quantize=config.GATE_QUANTIZE,
+                            classes=[config.PERSON_CLASS], verbose=False)
+        model = VioModel()
+        model.predict([np.zeros((config.CLIP_SIZE, config.CLIP_SIZE, 3), np.uint8)] * config.WIN_LEN)
+    return gate_model, model
+
+
 def _parse_cam_arg(spec: str) -> tuple[str, str]:
     if "=" not in spec:
-        raise SystemExit(f"--cam sai định dạng (cần NAME=SRC): {spec}")
+        raise ValueError(f"cam spec sai định dạng (cần NAME=SRC): {spec}")
     name, src = spec.split("=", 1)
     return name.strip(), src.strip()
+
+
+def parse_cams_env(spec: str) -> list[tuple[str, str]]:
+    """'cam1=src1;cam2=src2' (LIVE_CAMS) → [("cam1","src1"), ("cam2","src2")]. Rỗng → []."""
+    out = []
+    for part in spec.split(";"):
+        part = part.strip()
+        if part:
+            out.append(_parse_cam_arg(part))
+    return out
+
+
+def run_live(cam_specs: list[tuple[str, str]], on_result: Callable[[str, dict], None], *,
+             fps: float | None = None, loop: bool = False,
+             media: store.MediaStore | None = None) -> None:
+    """Chạy live pipeline (BLOCKING) tới khi nhận tín hiệu dừng (CLI) hoặc process kết thúc
+    (nhúng trong dashboard — daemon thread, không cần dừng sạch). Tự nạp model."""
+    gate_model, model = load_models()
+    media = media or store.MediaStore()
+    fps = float(config.GRAB_FPS) if fps is None else fps
+    cams = [LiveCam(name, src) for name, src in cam_specs]
+
+    threads = []
+    for cam in cams:
+        t = threading.Thread(target=_capture_worker, args=(cam.id, cam.src, fps, loop, cam.box),
+                              daemon=True, name=f"capture-{cam.id}")
+        t.start()
+        threads.append(t)
+
+    print(f"[live] {len(cams)} camera, gate={config.GATE_MODEL} model={config.VIO_BACKBONE} "
+          f"win={config.WIN_LEN} stride={config.WIN_STRIDE} (không qua Redis)")
+    try:
+        _run_infer_loop(cams, gate_model, model, on_result, media)
+    finally:
+        media.close()
+        for t in threads:
+            t.join(timeout=2.0)
 
 
 def main() -> None:
@@ -231,37 +349,12 @@ def main() -> None:
     ap.add_argument("--loop", action="store_true", help="nguồn FILE hết clip thì tua lại (demo)")
     args = ap.parse_args()
 
-    quiet_ml_logs()
-    with suppress_native_logs():        # nuốt log TRT/ultralytics lúc nạp engine + warmup (1 lần)
-        from ultralytics import YOLO
-        gate_model = YOLO(config.GATE_MODEL, task="detect", verbose=False)
-        gate_model.predict(np.zeros((config.GATE_IMGSZ, config.GATE_IMGSZ, 3), np.uint8),
-                            device=config.GATE_DEVICE, quantize=config.GATE_QUANTIZE,
-                            classes=[config.PERSON_CLASS], verbose=False)
-        model = VioModel()
-        model.predict([np.zeros((config.CLIP_SIZE, config.CLIP_SIZE, 3), np.uint8)] * config.WIN_LEN)
+    def _print_result(camera_id: str, result: dict) -> None:
+        print(f"[live {camera_id}] prob={result['prob']:.3f} persons={result['num_persons']} "
+              f"snap={'y' if result['snapshot_key'] else 'n'}")
 
-    media = store.MediaStore()
-    r = redis.from_url(config.REDIS_URL)
-    cams = [LiveCam(*_parse_cam_arg(spec)) for spec in args.cam]
-
-    threads = []
-    for cam in cams:
-        t = threading.Thread(target=_capture_worker,
-                              args=(cam.id, cam.src, args.fps, args.loop, cam.box),
-                              daemon=True, name=f"capture-{cam.id}")
-        t.start()
-        threads.append(t)
-
-    print(f"[live] {len(cams)} camera, gate={config.GATE_MODEL} model={config.VIO_BACKBONE} "
-          f"win={config.WIN_LEN} stride={config.WIN_STRIDE} → {config.RES_STREAM} "
-          f"(ingest+gate+classify KHÔNG qua Redis)")
-    try:
-        _run_infer_loop(cams, gate_model, model, r, media)
-    finally:
-        media.close()
-        for t in threads:
-            t.join(timeout=2.0)
+    cam_specs = [_parse_cam_arg(s) for s in args.cam]
+    run_live(cam_specs, _print_result, fps=args.fps, loop=args.loop)
 
 
 if __name__ == "__main__":
