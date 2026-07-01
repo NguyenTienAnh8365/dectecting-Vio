@@ -318,6 +318,13 @@ def run_live(cam_specs: list[tuple[str, str]], on_result: Callable[[str, dict], 
     gate_model, model = load_models()
     media = media or store.MediaStore()
     fps = float(config.GRAB_FPS) if fps is None else fps
+    # config.GRAB_FPS/WIN_SPAN tính SẴN lúc import (từ env, mặc định 12) — nếu caller truyền fps
+    # khác (vd CLI --fps demo nhanh hơn) mà không đồng bộ lại thì _process_one suy spans_frames
+    # SAI nhịp thật (đo thực tế 2026-07-01: 30fps mà GRAB_FPS còn 12 → cửa sổ "7s" chỉ còn ~2.8s
+    # thật, bỏ sót hẳn 1 cảnh bạo lực prob=0.96). Đồng bộ CẢ HAI ở đây, TRƯỚC khi tạo CamWindow
+    # (đọc config.WIN_SPAN lúc khởi tạo) — dashboard.app không truyền fps riêng nên không đổi gì.
+    config.GRAB_FPS = fps
+    config.WIN_SPAN = max(config.WIN_LEN, round(config.WIN_SECONDS * fps))
     cams = [LiveCam(name, src) for name, src in cam_specs]
 
     threads = []

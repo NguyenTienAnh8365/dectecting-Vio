@@ -5,7 +5,10 @@ opencv-python==4.13.0.92
 torch==2.12.1
 torchvision==0.27.1
 ultralytics==8.4.82
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
 # Dashboard
 fastapi==0.118.0
 uvicorn==0.34.0
 jinja2==3.1.4
+python-multipart==0.0.32
