@@ -6,7 +6,7 @@ opencv-python==4.13.0.92
 redis==8.0.1
 torch==2.12.1
 torchvision==0.27.1
-ultralytics==8.4.75
+ultralytics==8.4.82
 # Dashboard
 fastapi==0.118.0
 uvicorn==0.34.0
