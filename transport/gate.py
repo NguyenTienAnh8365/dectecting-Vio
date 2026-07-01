@@ -106,20 +106,24 @@ def process_batch(model, r, entries) -> int:
     if not imgs:
         return 0
 
-    results = model.predict(
-        imgs, device=config.GATE_DEVICE, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
-        classes=[config.PERSON_CLASS], quantize=config.GATE_QUANTIZE, verbose=False,
-    )
-
-    for eid, req, res, raw in zip(ids, reqs, results, raws):
-        boxes = persons_from(res)
-        # Forward NGUYÊN bytes JPEG gốc (không re-encode) + số người + bbox cho classifier.
-        r.xadd(
-            config.GATED_STREAM,
-            envelope.build_gated(req, len(boxes), boxes, raw),
-            maxlen=config.GATED_MAXLEN, approximate=True,
+    # Chia theo GATE_BATCH_SIZE (mặc định 1, khớp batch tĩnh của engine hiện tại) — không bao giờ
+    # gửi nhiều ảnh hơn engine chấp nhận vào 1 lần predict, dù backlog lớn cỡ nào (xem config).
+    bs = max(1, config.GATE_BATCH_SIZE)
+    for i in range(0, len(imgs), bs):
+        chunk = imgs[i:i + bs]
+        results = model.predict(
+            chunk, device=config.GATE_DEVICE, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
+            classes=[config.PERSON_CLASS], quantize=config.GATE_QUANTIZE, verbose=False,
         )
-        r.xack(config.REQ_STREAM, config.CG_GATE, eid)
+        for eid, req, res, raw in zip(ids[i:i + bs], reqs[i:i + bs], results, raws[i:i + bs]):
+            boxes = persons_from(res)
+            # Forward NGUYÊN bytes JPEG gốc (không re-encode) + số người + bbox cho classifier.
+            r.xadd(
+                config.GATED_STREAM,
+                envelope.build_gated(req, len(boxes), boxes, raw),
+                maxlen=config.GATED_MAXLEN, approximate=True,
+            )
+            r.xack(config.REQ_STREAM, config.CG_GATE, eid)
     return len(ids)
 
 

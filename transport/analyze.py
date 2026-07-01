@@ -178,6 +178,13 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
         cv2.imwrite(poster_path, first_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if on_progress:
         on_progress(1.0)
+    # PyTorch CUDA caching allocator giữ nguyên mốc VRAM cao nhất từng cấp phát (không tự trả
+    # driver) — video có người (batch multispan lớn hơn, nhánh crop+full) đẩy mốc lên rồi video
+    # sau dù nhỏ hơn cũng không tụt xuống. Dọn sau mỗi job để không cộng dồn qua nhiều lần upload
+    # trong 1 phiên dashboard chạy lâu (đo thực tế 2026-07-01: không dọn → dồn tới +180MB/lần đổi
+    # batch-size; dọn thì ổn định lại quanh mức cần thiết).
+    import torch
+    torch.cuda.empty_cache()
     return {
         "frames": idx,
         "fps": round(fps, 1),

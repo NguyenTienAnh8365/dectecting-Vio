@@ -74,6 +74,11 @@ GATE_HALF = os.getenv("GATE_HALF", "1") == "1"
 # ultralytics mới bỏ tham số predict 'half' → dùng 'quantize' (16=FP16, None=FP32). Map sẵn.
 GATE_QUANTIZE = 16 if GATE_HALF else None
 PERSON_CLASS = _int("PERSON_CLASS", 0)  # COCO 'person'
+# yolo26x.engine build BATCH TĨNH (=1) → gửi nhiều ảnh vào 1 lần predict sẽ crash AssertionError
+# khi backlog dồn về (đo thực tế 2026-07-01: 809 frame tồn đọng → batch=5 crash). gate.py chia
+# process_batch thành từng nhóm ≤ GATE_BATCH_SIZE để không bao giờ vượt batch engine. Đổi số này
+# NẾU rebuild engine với batch lớn hơn/dynamic (không tự đổi code).
+GATE_BATCH_SIZE = _int("GATE_BATCH_SIZE", 1)
 # Số người tối thiểu trong cửa sổ để alert được kích hoạt (gate alert, không gate frame).
 MIN_PERSONS = _int("MIN_PERSONS", 2)
 # Phân tích video upload: chỉ chạy YOLO mỗi N frame (tái dùng bbox cho overlay giữa các lần)
@@ -121,6 +126,11 @@ CROP_PAD = _float("CROP_PAD", 0.35)
 # transport/model.py:frames_to_clip_gpu). CHỈ áp dụng lúc infer — training (train_clip.py) vẫn
 # giữ nguyên cv2 CPU (DataLoader multi-process không hợp CUDA). Tắt về cv2 CPU bằng =0.
 PREP_GPU_RESIZE = os.getenv("PREP_GPU_RESIZE", "1") == "1"
+# classifier.py sống rất lâu (process live liên tục) — batch multispan đổi theo cảnh (đông người
+# → crop+full, vắng → chỉ full) làm PyTorch CUDA allocator giữ mốc VRAM cao nhất từng cấp phát,
+# cộng dồn qua thời gian (đo thực tế 2026-07-01, xem transport/analyze.py). Dọn định kỳ theo giờ
+# đồng hồ (không phải mỗi lần classify — empty_cache() đồng bộ hoá, gọi liên tục hại latency live).
+EMPTY_CACHE_INTERVAL_S = _int("EMPTY_CACHE_INTERVAL_S", 300)
 MODEL_VERSION = os.getenv("MODEL_VERSION", "untrained")
 
 # --- Logic alert (dashboard): chống false-positive + spam ------------------

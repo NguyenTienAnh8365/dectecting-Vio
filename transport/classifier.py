@@ -20,6 +20,7 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import redis
+import torch
 
 from . import config, envelope, store
 from .model import (VioModel, even_indices, multispan_predict, person_crop_box,
@@ -77,7 +78,7 @@ def main() -> None:
     print(f"[cls {name}] win={config.WIN_LEN} stride={config.WIN_STRIDE} "
           f"thr={config.VIO_THRESHOLD} consuming {config.GATED_STREAM} group {config.CG_CLS}")
 
-    total, classified, last_log = 0, 0, time.time()
+    total, classified, last_log, last_empty_cache = 0, 0, time.time(), time.time()
     while not _stop:
         try:
             resp = r.xreadgroup(
@@ -160,6 +161,12 @@ def main() -> None:
             print(f"[cls {name}] frames={total} classified={classified} cams={len(cams)} "
                   f"xlen={r.xlen(config.GATED_STREAM)}")
             last_log = now
+        if now - last_empty_cache >= config.EMPTY_CACHE_INTERVAL_S:
+            # Định kỳ theo giờ đồng hồ (không phải mỗi lần classify) — xem giải thích ở
+            # config.EMPTY_CACHE_INTERVAL_S. Chỉ tốn 1 lần sync mỗi chu kỳ, không ảnh hưởng
+            # latency của các lần classify bình thường ở giữa.
+            torch.cuda.empty_cache()
+            last_empty_cache = now
 
     media.close()
     print(f"[cls {name}] stopped. frames={total} classified={classified}")
