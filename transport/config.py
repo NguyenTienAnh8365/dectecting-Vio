@@ -88,7 +88,11 @@ VIO_CKPT = os.getenv("VIO_CKPT", "weights/vio_r2plus1d.pt")  # rỗng/không t�
 VIO_DEVICE = os.getenv("VIO_DEVICE", "0")
 VIO_HALF = os.getenv("VIO_HALF", "1") == "1"
 WIN_LEN = _int("WIN_LEN", 16)        # số frame ĐƯA VÀO model (mvit CỐ ĐỊNH 16)
-WIN_STRIDE = _int("WIN_STRIDE", 16)  # phân loại lại mỗi N frame mới (multispan đã phủ 3-7s → thưa được)
+# 8 (đã từng đổi lên 16 để analyze nhanh hơn — xem log cũ): hạ lại còn 8 để giảm độ trễ phản
+# ứng (chấm lại thường hơn = phát hiện sớm hơn). Chấp nhận được vì _PREP_POOL (threading resize
+# CPU trong predict_batch) đã giảm ~1.8× thời gian mỗi lần classify, bù lại phần tăng do gọi
+# nhiều lần hơn. Muốn trễ thấp hơn nữa thì hạ tiếp, đổi lại tốn compute hơn.
+WIN_STRIDE = _int("WIN_STRIDE", 8)
 # Span THỜI GIAN của 1 cửa sổ phân loại. Training lấy 16 frame TRẢI ĐỀU cả clip (~vài giây);
 # nếu infer lấy 16 frame LIÊN TIẾP (ở fps gốc chỉ ~0.5s) thì lệch train/serve về thời gian →
 # bỏ sót (đo trên VioPeru: recall 0.26 khi span 0.5s → 0.56 khi span ~3s). Nên: buffer
@@ -111,6 +115,12 @@ CLIP_SIZE = _int("CLIP_SIZE", _DEFAULT_SIZE.get(VIO_BACKBONE, 112))
 # hiệu). Tắt bằng CROP_TO_PERSON=0. CROP_PAD = phần đệm quanh union (tỉ lệ cạnh).
 CROP_TO_PERSON = os.getenv("CROP_TO_PERSON", "1") == "1"
 CROP_PAD = _float("CROP_PAD", 0.35)
+# Resize/normalize lúc INFER qua GPU tensor (F.interpolate mode="area", khớp thuật toán
+# INTER_AREA của cv2) thay vì cv2.resize CPU tuần tự — nhanh hơn ~1.9x, đã validate KHÔNG giảm
+# accuracy trên VioPeru test (F1 0.728→0.727, AUC 0.884→0.893, đo 2026-07-01, xem
+# transport/model.py:frames_to_clip_gpu). CHỈ áp dụng lúc infer — training (train_clip.py) vẫn
+# giữ nguyên cv2 CPU (DataLoader multi-process không hợp CUDA). Tắt về cv2 CPU bằng =0.
+PREP_GPU_RESIZE = os.getenv("PREP_GPU_RESIZE", "1") == "1"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "untrained")
 
 # --- Logic alert (dashboard): chống false-positive + spam ------------------

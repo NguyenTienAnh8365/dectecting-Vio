@@ -9,6 +9,7 @@ KHÔNG bắn alert giả). Phải fine-tune rồi trỏ VIO_CKPT mới có giá 
 """
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import os
 
@@ -32,6 +33,11 @@ BACKBONE_SPEC = {
     "mvit_v2_s":   dict(size=224, clip_len=16, mean=_KIN_T_MEAN, std=_KIN_T_STD),
 }
 _BACKBONES = set(BACKBONE_SPEC)
+
+# frames_to_clip (resize+normalize CPU) là phần ĐẮT nhất của 1 lần classify, không phải forward
+# GPU (đo: multispan 4 biến thể span×crop/full ~95ms resize/clip vs ~16ms forward cho cả batch).
+# cv2.resize/cvtColor nhả GIL → threading (không cần multiprocessing) chạy song song các clip.
+_PREP_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="preproc")
 
 
 def spec_of(backbone: str) -> dict:
@@ -97,6 +103,45 @@ def frames_to_clip(frames: list[np.ndarray], backbone: str, *, flip: bool = Fals
         clip.append((f - mean) / std)
     arr = np.stack(clip, axis=0)            # [T, H, W, C]
     return np.transpose(arr, (3, 0, 1, 2))  # [C, T, H, W]
+
+
+_MEAN_STD_GPU: dict = {}  # (backbone, device) -> (mean, std) tensor đã đặt trên GPU, tránh tạo lại mỗi lần
+
+
+def _mean_std_gpu(backbone: str, device: str):
+    key = (backbone, str(device))
+    cached = _MEAN_STD_GPU.get(key)
+    if cached is None:
+        import torch
+        sp = spec_of(backbone)
+        mean = torch.tensor(sp["mean"], device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor(sp["std"], device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        cached = _MEAN_STD_GPU[key] = (mean, std)
+    return cached
+
+
+def frames_to_clip_gpu(frames: list[np.ndarray], backbone: str, device: str):
+    """Biến thể GPU của frames_to_clip — CHỈ dùng lúc INFER (predict_batch), KHÔNG dùng cho
+    training/ClipDataset (DataLoader multi-process không hợp CUDA; train vẫn giữ cv2/CPU nguyên
+    vẹn để không đổi số liệu train). Resize bằng F.interpolate(mode="area") — khớp thuật toán
+    INTER_AREA của cv2 (khác bilinear) — thay vì cv2.resize tuần tự CPU. Đã validate trên VioPeru
+    test 2026-07-01: F1 0.728→0.727, AUC 0.884→0.893 (trong biên độ nhiễu), nhanh hơn ~1.9x/clip.
+
+    Gọi qua _PREP_POOL (không tuần tự) — phần CPU (np.stack ghép frame) vẫn là chi phí thật, chạy
+    song song giữa các clip mới nhanh hơn cv2-threadpool cũ (đo: 80.6ms→63.1ms/lần multispan);
+    gọi tuần tự từng clip thì CHẬM HƠN cả cv2 (mỗi lần .to(device) có overhead cố định riêng).
+    """
+    import torch
+    import torch.nn.functional as Fn
+    sp = spec_of(backbone)
+    size = sp["size"]
+    mean, std = _mean_std_gpu(backbone, device)
+    arr = np.stack(frames, axis=0)                                    # [T,H,W,C] uint8 BGR
+    t = torch.from_numpy(arr).to(device)
+    t = t[..., [2, 1, 0]].permute(0, 3, 1, 2).float() / 255.0          # [T,C,H,W] RGB float
+    t = Fn.interpolate(t, size=(size, size), mode="area")
+    t = (t - mean) / std
+    return t.permute(1, 0, 2, 3)                                      # [C,T,H,W]
 
 
 class _TrtRunner:
@@ -287,7 +332,17 @@ class VioModel:
         if self.mode == "engine":
             return [self.predict(c) for c in clips]
         with self.torch.no_grad():
-            xs = [self.torch.from_numpy(frames_to_clip(c, self.backbone)) for c in clips]
+            gpu_resize = config.PREP_GPU_RESIZE and self.dev != "cpu"
+            if len(clips) > 1:  # song song hoá phần CPU (np.stack/resize) giữa các clip qua _PREP_POOL
+                if gpu_resize:
+                    xs = list(_PREP_POOL.map(lambda c: frames_to_clip_gpu(c, self.backbone, self.dev), clips))
+                else:
+                    arrs = list(_PREP_POOL.map(lambda c: frames_to_clip(c, self.backbone), clips))
+                    xs = [self.torch.from_numpy(a) for a in arrs]
+            elif gpu_resize:
+                xs = [frames_to_clip_gpu(clips[0], self.backbone, self.dev)]
+            else:
+                xs = [self.torch.from_numpy(frames_to_clip(clips[0], self.backbone))]
             x = self.torch.stack(xs).to(self.dev)
             if self.half and self.dev != "cpu":
                 x = x.half()
