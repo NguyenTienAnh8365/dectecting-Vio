@@ -107,6 +107,7 @@ _live: dict[str, dict] = {}                 # camera_id → {prob, num_persons, 
 _alerts: deque = deque(maxlen=100)          # alert gần nhất (mới ở đầu)
 _windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=config.ALERT_N))
 _last_alert: dict[str, float] = {}
+_last_positive: dict[str, dict] = {}  # camera_id → result DƯƠNG gần nhất (prob cao + có media)
 _subscribers: list[asyncio.Queue] = []
 _loop: asyncio.AbstractEventLoop | None = None
 _alert_seq = 0
@@ -139,6 +140,8 @@ def _handle_live_result(camera_id: str, result: dict) -> None:
         _live[camera_id] = {"prob": prob, "num_persons": result["num_persons"], "ts": result["ts"]}
         w = _windows[camera_id]
         w.append(1 if positive else 0)
+        if positive:
+            _last_positive[camera_id] = result
         # Alert khi: đủ K/N cửa sổ dương (kéo dài) HOẶC 1 cửa sổ mạnh (chớp nhoáng, không để
         # k-of-n nuốt mất). Cả hai vẫn tôn trọng cooldown chống spam.
         fire = ((sum(w) >= config.ALERT_K or strong)
@@ -147,14 +150,19 @@ def _handle_live_result(camera_id: str, result: dict) -> None:
         if fire:
             _last_alert[camera_id] = now
             _alert_seq += 1
+            # k-of-n có thể chỉ đủ K Ở CỬA SỔ HIỆN TẠI KHÔNG DƯƠNG (vd 3 dương rồi 1 cửa sổ
+            # nguội mới kích vì cooldown vừa hết) → alert phải mang prob + snapshot/clip của
+            # cửa sổ DƯƠNG gần nhất, không phải cửa sổ kích hoạt (từng thấy alert prob=0.02
+            # không có ảnh — vô nghĩa với trực ban).
+            ev = result if positive else _last_positive.get(camera_id, result)
             alert = {
                 "id": _alert_seq,
                 "camera_id": camera_id,
-                "time": datetime.fromtimestamp(result["ts"]).strftime("%H:%M:%S %d/%m"),
-                "prob": prob,
-                "num_persons": result["num_persons"],
-                "snapshot_url": _media_url(result.get("snapshot_key", "")),
-                "clip_url": _media_url(result.get("clip_key", "")),
+                "time": datetime.fromtimestamp(ev["ts"]).strftime("%H:%M:%S %d/%m"),
+                "prob": ev["prob"],
+                "num_persons": ev["num_persons"],
+                "snapshot_url": _media_url(ev.get("snapshot_key", "")),
+                "clip_url": _media_url(ev.get("clip_key", "")),
             }
             _alerts.appendleft(alert)
 

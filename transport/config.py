@@ -65,6 +65,21 @@ MIN_PERSONS = _int("MIN_PERSONS", 2)
 # → giảm số lần infer gate, nhanh hơn. Vẫn ép chạy gate đúng frame quyết định cửa sổ để
 # đếm người chính xác. Tăng lên 3-4 nếu cần nhanh hơn nữa (bbox trễ tối đa N frame).
 ANALYZE_GATE_EVERY = _int("ANALYZE_GATE_EVERY", 3)
+# Live: cùng trick — YOLO mỗi N frame, frame giữa tái dùng bbox cũ (người không dịch đáng kể
+# trong ~0.25s @ 12fps). Đo 3060 2026-07-02: gate yolo26x 17.4ms/frame = 46% GPU/camera →
+# N=3 cắt ~2/3 phần đó. Vẫn ép gate đúng frame QUYẾT ĐỊNH cửa sổ (đếm người chuẩn cho alert).
+LIVE_GATE_EVERY = _int("LIVE_GATE_EVERY", 3)
+# Bỏ classify khi cả cửa sổ KHÔNG có người (max persons < mức này) — camera vắng (phần lớn
+# thời gian CCTV thật) chỉ tốn gate, không tốn MViT (166ms/lần trên 3060). Alert vốn đã cần
+# MIN_PERSONS≥2 nên bỏ classify lúc 0 người không thể làm mất alert; để 1 cho an toàn
+# (YOLO sót người 1 vài frame vẫn còn các frame khác trong cửa sổ giữ classify chạy).
+CLASSIFY_MIN_PERSONS = _int("CLASSIFY_MIN_PERSONS", 1)
+# Số worker classify chạy SONG SONG với gate thread (pipeline 2 tầng). 1 thread tuần tự
+# gate→preprocess→forward để GPU nghỉ lúc CPU làm việc (đo 4 cam 2026-07-02: GPU util chỉ
+# ~83%). torch forward/cv2 nhả GIL nên threading đủ (không cần process). 2 worker cho phép
+# preprocess clip này chồng lên forward clip kia. Job per-cam kiểu mailbox: cửa sổ mới nhất
+# thắng, không tích backlog (đúng tinh thần FrameBox).
+LIVE_CLASSIFY_WORKERS = _int("LIVE_CLASSIFY_WORKERS", 2)
 
 # --- Classifier clip-level --------------------------------------------------
 VIO_BACKBONE = os.getenv("VIO_BACKBONE", "mvit_v2_s")  # torchvision.models.video (đã đổi từ r2plus1d_18)
@@ -73,11 +88,12 @@ VIO_CKPT = os.getenv("VIO_CKPT", "weights/vio_r2plus1d.pt")  # rỗng/không t�
 VIO_DEVICE = os.getenv("VIO_DEVICE", "0")
 VIO_HALF = os.getenv("VIO_HALF", "1") == "1"
 WIN_LEN = _int("WIN_LEN", 16)        # số frame ĐƯA VÀO model (mvit CỐ ĐỊNH 16)
-# 8 (đã từng đổi lên 16 để analyze nhanh hơn — xem log cũ): hạ lại còn 8 để giảm độ trễ phản
-# ứng (chấm lại thường hơn = phát hiện sớm hơn). Chấp nhận được vì _PREP_POOL (threading resize
-# CPU trong predict_batch) đã giảm ~1.8× thời gian mỗi lần classify, bù lại phần tăng do gọi
-# nhiều lần hơn. Muốn trễ thấp hơn nữa thì hạ tiếp, đổi lại tốn compute hơn.
-WIN_STRIDE = _int("WIN_STRIDE", 8)
+# Số frame giữa 2 lần classify. @GRAB_FPS=30: 15 frame = chấm mỗi 0.5s (chốt 2026-07-02).
+# Chấm dày hơn KHÔNG tăng khả năng phát hiện: mỗi lần chấm model nhìn cả cửa sổ 3s/7s lịch sử,
+# trượt 0.5s/bước nên cú đánh 1s vẫn nằm trong ~6-14 lần chấm liên tiếp; đường strong nổ ≤0.5s.
+# Mỗi lần chấm ~156ms GPU → stride là núm vặn compute số 1 (15 → 2 lần/s/cam có người).
+# ALERT_K/N phải chỉnh THEO stride để giữ ngữ nghĩa thời gian (xem dưới).
+WIN_STRIDE = _int("WIN_STRIDE", 15)
 # Span THỜI GIAN của 1 cửa sổ phân loại. Training lấy 16 frame TRẢI ĐỀU cả clip (~vài giây);
 # nếu infer lấy 16 frame LIÊN TIẾP (ở fps gốc chỉ ~0.5s) thì lệch train/serve về thời gian →
 # bỏ sót (đo trên VioPeru: recall 0.26 khi span 0.5s → 0.56 khi span ~3s). Nên: buffer
@@ -122,13 +138,20 @@ MODEL_VERSION = os.getenv("MODEL_VERSION", "untrained")
 # => verdict = (đủ K/N ở mức thấp) OR (có ≥1 cửa sổ ở mức mạnh). Cả hai vẫn qua gate người.
 VIO_THRESHOLD = _float("VIO_THRESHOLD", 0.50)         # ngưỡng "dương" cho đường kéo dài
 VIO_THRESHOLD_STRONG = _float("VIO_THRESHOLD_STRONG", 0.80)  # 1 cửa sổ ≥ mức này → alert ngay
-ALERT_K = _int("ALERT_K", 3)         # cần K cửa sổ dương...
-ALERT_N = _int("ALERT_N", 5)         # ...trong N cửa sổ gần nhất → alert
+# K/N định nghĩa theo SỐ CỬA SỔ nên ngữ nghĩa THỜI GIAN phụ thuộc nhịp chấm (WIN_STRIDE/GRAB_FPS).
+# Thiết kế gốc (tune trên VioPeru): ~2s dương trong ~3.3s. @30fps stride 15 (chấm mỗi 0.5s):
+# K=4/N=7 = 2s dương trong 3.5s — GIỮ NGUYÊN ngữ nghĩa đó. Đổi stride thì tính lại:
+# K ≈ 2s/(stride/fps), N ≈ 3.5s/(stride/fps).
+ALERT_K = _int("ALERT_K", 4)         # cần K cửa sổ dương...
+ALERT_N = _int("ALERT_N", 7)         # ...trong N cửa sổ gần nhất → alert
 COOLDOWN_S = _int("COOLDOWN_S", 45)  # mỗi camera tối đa 1 alert / COOLDOWN_S giây
 
 # --- Lưu bằng chứng (disk local, dashboard serve) --------------------------
 MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
-SAVE_PROB = _float("SAVE_PROB", 0.50)  # prob >= mức này thì classifier lưu snapshot+clip
+# prob >= mức này thì classifier lưu snapshot+clip. RÀNG BUỘC: phải ≤ VIO_THRESHOLD — alert
+# k-of-n mượn snapshot của cửa sổ DƯƠNG gần nhất (dashboard._handle_live_result), nếu cửa sổ
+# dương mà không lưu media thì alert trắng ảnh. Kẹp cứng để không ai chỉnh lệch được.
+SAVE_PROB = min(_float("SAVE_PROB", 0.50), VIO_THRESHOLD)
 MEDIA_TTL_DAYS = _int("MEDIA_TTL_DAYS", 3)
 
 # --- Dashboard --------------------------------------------------------------

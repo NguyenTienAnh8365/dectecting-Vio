@@ -45,10 +45,31 @@ video upload ─> dashboard /api/upload ─> analyze.py (YOLO gate + classifier)
 
 > **Đã đổi base model r2plus1d_18 → MViT v2-S** (video transformer mạnh hơn) + train production
 > đa-dataset. MViT cần input **16 frame × 224×224**, norm Kinetics [0.45]/[0.225] (CỐ ĐỊNH theo
-> positional-embed). YOLO gate vẫn build **TensorRT FP16** (`yolo26x.engine`). **MViT KHÔNG export
-> được TRT** (op `SequenceAt/Empty/Insert` của pooling-attention, parser TRT 11.x không hỗ trợ) →
-> classifier chạy **torch-FP16** từ `weights/vio_mvit_v2_s.pt` (vẫn nhanh trên Blackwell). Checkpoint
-> r2plus1d cũ + engine giữ làm fallback.
+> positional-embed). YOLO gate build **TensorRT FP16**. **MViT ĐÃ export được TRT** (dùng dynamo
+> exporter — bản TorchScript cũ sinh op `SequenceAt/…` mới fail, xem [train/export_trt.py](train/export_trt.py);
+> parity |Δprob| ≤ 0.001) NHƯNG trên GPU lớp Ampere TRT **không nhanh hơn torch-FP16** (batch-1
+> 1.05x, batch-4 0.80x, dynamic-batch 0.5x — đo 3060 2026-07-02) → classifier live vẫn chạy
+> **torch-FP16** từ `weights/vio_mvit_v2_s.pt`; engine chỉ đáng bật trên Jetson (đo lại trên máy
+> đích). Mọi file `.engine` gắn chặt GPU build — build lại trên máy triển khai, không copy chéo.
+
+## Capacity thực tế @30fps (đo 2026-07-02, RTX 3060 12GB ≈ A2000 12GB; A2000 chậm hơn ~25%)
+
+| Thành phần | ms | Ghi chú |
+|---|---|---|
+| Gate yolo26x TRT-FP16 | 13.0/frame | 194 GFLOPs — quá to cho bài "chỉ tìm người" |
+| Gate **yolo26m** TRT-FP16 | **7.4/frame** | khuyến nghị: chạy nổi 30fps thật |
+| Gate yolo26s TRT-FP16 | 5.3/frame | nếu cần thêm cam (đổi lấy sót người nhỏ/xa) |
+| MViT multispan (batch 4: 2 span × full+crop) | 156/lần | torch-FP16 |
+
+Cấu hình chốt (`GRAB_FPS=30`, `WIN_STRIDE=15` → classify mỗi 0.5s; `ALERT_K=4/N=7` = 2s dương
+trong 3.5s — đổi stride phải tính lại K/N theo công thức trong config.py; gate yolo26m): 1 cam
+**có người** ≈ 534ms GPU/giây (gate 221 + MViT 313) → **3060 ~2 cam, A2000 ~1.5 cam "nóng"
+đồng thời** (pipeline 2 tầng gate-thread + `LIVE_CLASSIFY_WORKERS=2` chồng preprocess/forward,
+đo +23% throughput so với vòng tuần tự); cam **vắng người** chỉ tốn gate (221ms) nhờ
+classify-skip → A2000 kham **3-4 cam** nếu phần lớn thời gian vắng (CCTV thật). Muốn nhiều cam
+hơn: `WIN_STRIDE=24` (+20%), gate yolo26s (+15%), hoặc nâng GPU (RTX 4000 Ada / 4070 Ti ≈ gấp
+đôi A2000). VRAM không phải nút cổ chai (~3.7GB đo 4 cam) — nghẽn ở compute; RAM CPU
+~600MB/cam (buffer 210 frame 720p).
 
 ## Cài đặt (server Blackwell — dùng `uv`)
 

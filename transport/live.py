@@ -10,16 +10,18 @@ classifier worker qua Redis → độ trễ tăng dần 15s→26s trong 35s, kh�
 
 Kiến trúc: mỗi camera 1 thread capture giữ "ô nhớ" (FrameBox) đúng 1 frame MỚI NHẤT — không có
 hàng đợi, frame cũ chưa kịp xử lý bị ghi đè thẳng (đúng tinh thần realtime: luôn ưu tiên hiện
-tại hơn lịch sử). 1 vòng lặp infer round-robin qua các camera, lấy frame mới nhất mỗi cam →
-gate (YOLO người, đúng 1 ảnh/lần — tự nhiên khớp batch tĩnh=1 của engine) → nạp cửa sổ trượt
-per-camera (CamWindow) → đủ WIN_LEN/WIN_STRIDE thì classify (multispan) → gọi thẳng callback
+tại hơn lịch sử). Pipeline infer 2 TẦNG: vòng gate round-robin qua các camera, lấy frame mới
+nhất mỗi cam → gate (YOLO người, 1 ảnh/lần — khớp batch tĩnh=1 của engine) → nạp cửa sổ trượt
+per-camera (CamWindow) → đủ WIN_LEN/WIN_STRIDE thì đặt JOB vào mailbox per-cam; các classify
+worker (LIVE_CLASSIFY_WORKERS thread) lấy job chạy multispan song song → gọi thẳng callback
 `on_result(camera_id, result)` do CALLER cung cấp (dashboard.app gọi trực tiếp trong process
 của nó — không cần message bus vì cùng 1 server).
 
-Giới hạn đã biết: spans_frames (multispan_predict) suy ra SỐ FRAME từ WIN_SECONDS_LIST*GRAB_FPS
-(giả định buffer lấp đầy đúng nhịp GRAB_FPS). Nếu 1 server quá tải nhiều camera tới mức infer
-chậm hơn camera gửi, frame bị bỏ (mailbox ghi đè) khiến cửa sổ trải dài hơn WIN_SECONDS_LIST
-thực tế — chấp nhận được ở quy mô vài camera của dự án, nhưng cần lưu ý nếu mở rộng sau này.
+Nhịp thời gian: _process_one throttle theo GIỜ THẬT (bỏ frame tới sớm hơn 1/GRAB_FPS — camera
+25-30fps không làm buffer phủ hụt span), và spans_frames đếm theo TIMESTAMP từng frame (không
+suy từ GRAB_FPS) — server quá tải làm frame giãn ra thì span vẫn đúng số giây cấu hình.
+Tiết kiệm compute: YOLO chỉ chạy mỗi LIVE_GATE_EVERY frame (ép chạy ở frame quyết định cửa
+sổ), và MViT bị bỏ qua hẳn khi cả cửa sổ không có người (camera vắng chỉ tốn gate).
 
 Dùng (nhúng trong dashboard — xem dashboard/app.py):
   cams = parse_cams_env(config.LIVE_CAMS)
@@ -86,8 +88,10 @@ class CamWindow:
         self.frames: deque = deque(maxlen=config.WIN_SPAN)
         self.persons: deque = deque(maxlen=config.WIN_SPAN)
         self.boxes: deque = deque(maxlen=config.WIN_SPAN)
+        self.tss: deque = deque(maxlen=config.WIN_SPAN)  # timestamp từng frame → span theo GIỜ THẬT
         self.boxes_last: list = []
         self.since_last = 0
+        self.since_gate = 0   # số frame từ lần chạy YOLO gần nhất (gate-skip, xem LIVE_GATE_EVERY)
         self.last_ts = 0.0
         self.last_seq = 0
 
@@ -149,6 +153,12 @@ class LiveCam:
         self.box = FrameBox()
         self.window = CamWindow()
         self.last_taken = -1  # seq cuối đã đưa qua gate (khác window.last_seq — dùng cho kết quả)
+        # Pipeline 2 tầng: gate thread đặt "job" cửa sổ cần classify vào pending (mailbox —
+        # cửa sổ mới nhất thắng, không tích backlog); classify worker lấy ra chạy. busy giữ
+        # tối đa 1 classify đồng thời/cam → kết quả mỗi cam vẫn ĐÚNG THỨ TỰ cho k-of-n.
+        self.lock = threading.Lock()
+        self.pending: dict | None = None
+        self.busy = False
 
 
 def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: FrameBox) -> None:
@@ -200,69 +210,134 @@ def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: Frame
     print(f"[live {camera_id}] capture dừng. frames={seq}")
 
 
-def _process_one(cam: LiveCam, gate_model, model, on_result: Callable[[str, dict], None],
-                  media: store.MediaStore) -> bool:
-    """Lấy frame mới nhất của 1 camera (nếu có) → gate → nạp cửa sổ → classify khi đủ stride.
+def _process_one(cam: LiveCam, gate_model) -> bool:
+    """Tầng GATE: lấy frame mới nhất của 1 camera (nếu có) → YOLO → nạp cửa sổ → khi đủ stride
+    thì ĐÓNG GÓI job classify vào cam.pending (worker riêng chạy, không chặn gate).
 
     Trả False nếu camera chưa có frame mới (để vòng ngoài biết lúc nào nên ngủ, tránh busy-loop).
     """
     frame, ts, seq = cam.box.get()
     if frame is None or seq == cam.last_taken:
         return False
+    w = cam.window
+    # Throttle theo nhịp GRAB_FPS bằng GIỜ THẬT: camera RTSP 25-30fps mà lấy mọi frame thì buffer
+    # WIN_SPAN (tính theo GRAB_FPS) chỉ phủ ~nửa span thời gian định cấu hình → cửa sổ "7s" thành
+    # ~3s, lệch train/serve. Bỏ frame tới sớm hơn ~1/GRAB_FPS (0.9 nhân nhượng jitter) — mailbox
+    # vẫn giữ frame mới nhất nên không mất gì, vòng sau lấy đúng nhịp.
+    if w.last_ts and ts - w.last_ts < 0.9 / config.GRAB_FPS:
+        return False
     cam.last_taken = seq
 
-    results = gate_model.predict(
-        frame, device=config.GATE_DEVICE, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
-        classes=[config.PERSON_CLASS], quantize=config.GATE_QUANTIZE, verbose=False,
-    )
-    boxes = persons_from(results[0])
+    # Gate-skip (LIVE_GATE_EVERY): chỉ chạy YOLO mỗi N frame, giữa các lần tái dùng bbox cũ —
+    # nhưng ÉP chạy đúng frame quyết định cửa sổ để đếm người chuẩn (cùng trick với analyze.py).
+    deciding = (len(w.frames) + 1 >= config.WIN_LEN
+                and w.since_last + 1 >= config.WIN_STRIDE)
+    if deciding or w.since_gate >= max(1, config.LIVE_GATE_EVERY) - 1 or not w.tss:
+        results = gate_model.predict(
+            frame, device=config.GATE_DEVICE, imgsz=config.GATE_IMGSZ, conf=config.GATE_CONF,
+            classes=[config.PERSON_CLASS], quantize=config.GATE_QUANTIZE, verbose=False,
+        )
+        boxes = persons_from(results[0])
+        w.since_gate = 0
+    else:
+        boxes = w.boxes_last  # bbox trễ tối đa N-1 frame (~0.17s @ 12fps) — chấp nhận được
+        w.since_gate += 1
 
-    w = cam.window
     w.frames.append(frame)
     w.persons.append(len(boxes))
     w.boxes.append(boxes)
+    w.tss.append(ts)
     w.boxes_last = boxes
     w.since_last += 1
     w.last_ts = ts
     w.last_seq = seq
 
-    if len(w.frames) >= config.WIN_LEN and w.since_last >= config.WIN_STRIDE:
+    if deciding:
         w.since_last = 0
-        fr_all, bx_all = list(w.frames), list(w.boxes)
-        h0, w0 = fr_all[-1].shape[:2]
-        spans_frames = [round(s * config.GRAB_FPS) for s in config.WIN_SECONDS_LIST]
-        prob, _ = multispan_predict(model, fr_all, bx_all, spans_frames, w0, h0)
-        frames = [fr_all[i] for i in even_indices(len(fr_all), config.WIN_LEN)]
-        med_persons = int(statistics.median(w.persons))
-
-        snapshot_key, clip_key = "", ""
-        if prob >= config.SAVE_PROB:
-            mid = frames[len(frames) // 2]
-            snap = annotate(mid, w.boxes_last, prob)
-            snapshot_key = media.save_snapshot_async(cam.id, ts, snap)
-            clip_key = media.save_clip_async(cam.id, ts, frames)
-
-        result = {
-            "prob": round(prob, 4),
-            "num_persons": med_persons,
-            "ts": ts,
-            "seq": seq,
-            "snapshot_key": snapshot_key,
-            "clip_key": clip_key,
-            "model": config.VIO_BACKBONE,
-            "modelVersion": config.MODEL_VERSION,
+        fr_all, bx_all, ts_all = list(w.frames), list(w.boxes), list(w.tss)
+        # Span theo TIMESTAMP THẬT thay vì suy từ GRAB_FPS: nếu infer tụt nhịp (server quá tải,
+        # mailbox bỏ frame) thì khoảng cách frame giãn ra — đếm số frame nằm trong s giây cuối
+        # cho đúng span thời gian, hết hẳn giới hạn "cửa sổ trải dài hơn WIN_SECONDS" ở docstring.
+        job = {
+            "frames": fr_all, "boxes": bx_all,
+            "spans": [sum(1 for t in ts_all if t >= ts - s) for s in config.WIN_SECONDS_LIST],
+            "persons": list(w.persons), "boxes_last": w.boxes_last,
+            "ts": ts, "seq": seq,
         }
-        on_result(cam.id, result)
+        with cam.lock:
+            cam.pending = job  # ghi đè job cũ chưa kịp chạy (mailbox — mới nhất thắng)
     return True
+
+
+def _classify_one(cam: LiveCam, job: dict, model, on_result: Callable[[str, dict], None],
+                   media: store.MediaStore) -> None:
+    """Tầng CLASSIFY (worker): chạy MViT multispan trên 1 job cửa sổ + lưu bằng chứng + callback."""
+    fr_all, bx_all = job["frames"], job["boxes"]
+    h0, w0 = fr_all[-1].shape[:2]
+    # Classify-skip: cả cửa sổ không có người (camera vắng — phần lớn thời gian CCTV thật)
+    # → khỏi tốn MViT, prob=0. Alert cần MIN_PERSONS≥2 nên không thể mất alert vì skip này.
+    if max(job["persons"]) >= config.CLASSIFY_MIN_PERSONS:
+        prob, _ = multispan_predict(model, fr_all, bx_all, job["spans"], w0, h0)
+    else:
+        prob = 0.0
+    frames = [fr_all[i] for i in even_indices(len(fr_all), config.WIN_LEN)]
+    med_persons = int(statistics.median(job["persons"]))
+
+    snapshot_key, clip_key = "", ""
+    if prob >= config.SAVE_PROB:
+        mid = frames[len(frames) // 2]
+        snap = annotate(mid, job["boxes_last"], prob)
+        snapshot_key = media.save_snapshot_async(cam.id, job["ts"], snap)
+        clip_key = media.save_clip_async(cam.id, job["ts"], frames)
+
+    result = {
+        "prob": round(prob, 4),
+        "num_persons": med_persons,
+        "ts": job["ts"],
+        "seq": job["seq"],
+        "snapshot_key": snapshot_key,
+        "clip_key": clip_key,
+        "model": config.VIO_BACKBONE,
+        "modelVersion": config.MODEL_VERSION,
+    }
+    on_result(cam.id, result)
+
+
+def _classify_worker(cams: list[LiveCam], model, on_result: Callable[[str, dict], None],
+                      media: store.MediaStore) -> None:
+    """Worker classify: quét round-robin job pending của các cam. busy flag giữ tối đa 1 job
+    đồng thời/cam (kết quả mỗi cam đúng thứ tự); nhiều worker → preprocess clip cam này chồng
+    lên forward clip cam kia, lấp khoảng GPU nghỉ của pipeline tuần tự cũ."""
+    while not _stop:
+        did_work = False
+        for cam in cams:
+            with cam.lock:
+                if cam.pending is None or cam.busy:
+                    continue
+                job, cam.pending, cam.busy = cam.pending, None, True
+            try:
+                _classify_one(cam, job, model, on_result, media)
+                did_work = True
+            finally:
+                cam.busy = False
+        if not did_work:
+            time.sleep(0.005)
 
 
 def _run_infer_loop(cams: list[LiveCam], gate_model, model,
                      on_result: Callable[[str, dict], None], media: store.MediaStore) -> None:
+    """Vòng chính = tầng GATE; classify chạy ở LIVE_CLASSIFY_WORKERS thread riêng (pipeline 2 tầng)."""
+    workers = [threading.Thread(target=_classify_worker, args=(cams, model, on_result, media),
+                                 daemon=True, name=f"classify-{i}")
+               for i in range(max(1, config.LIVE_CLASSIFY_WORKERS))]
+    for t in workers:
+        t.start()
+
     total, last_log, last_empty_cache = 0, time.time(), time.time()
     while not _stop:
         did_work = False
         for cam in cams:
-            if _process_one(cam, gate_model, model, on_result, media):
+            if _process_one(cam, gate_model):
                 did_work = True
                 total += 1
 
