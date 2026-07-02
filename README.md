@@ -91,6 +91,25 @@ cp .env.example .env           # điền LIVE_CAMS, trỏ VIO_ENGINE/GATE_MODEL 
 | **Surveillance Fight** (300) | CCTV công cộng | GitHub `sayibet/fight-detection-surv-dataset` | train/val |
 | **VioPeru** (367) | **CCTV thật Peru** | GitHub `hhuillcen/VioPeru` | **test cross-domain (giữ riêng)** |
 
+**Đợt mở rộng CCTV (kế hoạch 2026-07-02 — thu hẹp domain-gap, mục tiêu recall VioPeru 0.56→0.65+):**
+
+| Dataset | Domain | Nguồn | Ghi chú chuẩn bị |
+|---|---|---|---|
+| **UBI-Fights** (1k video, 80h, nhãn theo frame) | CCTV giám sát thật | [socia-lab.di.ubi.pt/EventDetection](http://socia-lab.di.ubi.pt/EventDetection/) — tải trực tiếp | video dài → cắt clip 3-7s theo nhãn frame-level; đoạn normal cùng video làm negative |
+| **UCF-Crime** (chỉ lấy Fighting/Assault/Abuse + Normal) | **CCTV cột thật — khớp Như Quỳnh nhất** | [crcv.ucf.edu/projects/real-world](https://www.crcv.ucf.edu/projects/real-world/) (Dropbox ~128GB; chỉ cần các lớp trên, không tải cả bộ) | video untrimmed → trích đoạn violence theo temporal annotation + sample Normal |
+| **CCTV-Fights** (1k video, 280 CCTV thật) | CCTV đánh nhau thật | [rose1.ntu.edu.sg/dataset/cctvFights](https://rose1.ntu.edu.sg/dataset/cctvFights/) — **phải đăng ký + ký agreement, nộp sớm** | dùng cho đợt sau khi được duyệt |
+| Bus Violence (1.4k clip, Zenodo) / XD-Violence (4.7k, trộn phim) | phụ | [zenodo 7044203](https://zenodo.org/records/7044203) / [roc-ng.github.io/XD-Violence](https://roc-ng.github.io/XD-Violence/) | ưu tiên thấp: bus = diễn + nền rung; XD nhãn yếu, lệch domain — nếu dùng chỉ lọc subset Fighting/Riot ngắn |
+
+> **Cách train khi thêm bộ mới: GỘP vào manifest chung, train lại 1 lần từ Kinetics-pretrained**
+> — KHÔNG fine-tune tuần tự trên riêng bộ mới (catastrophic forgetting: model lệch hẳn về domain
+> mới, quên 4 bộ cũ). Quy trình: cắt clip → thêm vào `data/` đúng cấu trúc → `build_manifest`
+> (thêm nguồn mới) → `precompute_boxes` (chỉ chạy phần clip mới) → `train_clip` từ đầu với đủ
+> 6 bộ (class-weight tự cân bằng) → `eval_test` trên VioPeru để so domain-gap trước/sau —
+> **VioPeru vẫn giữ nguyên là test, không đưa vào train** (thước đo cross-domain duy nhất;
+> chỉ gộp vào train khi đã có bộ test footage Như Quỳnh thật thay thế).
+> Negative "cùng bối cảnh" (đoạn normal cắt từ chính video có violence) là loại negative giá
+> trị nhất — dạy model phân biệt tụ tập bình thường vs xô xát trên cùng một khung camera.
+
 SCVD bỏ lớp **Weaponized** (súng/dao tĩnh ít motion → nhiễu nhãn cho 3D/transformer). Tải:
 `scripts/download_datasets.sh` + `scripts/build_scvd_clips.py`.
 
