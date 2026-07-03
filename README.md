@@ -110,6 +110,29 @@ cp .env.example .env           # điền LIVE_CAMS, trỏ VIO_ENGINE/GATE_MODEL 
 > Negative "cùng bối cảnh" (đoạn normal cắt từ chính video có violence) là loại negative giá
 > trị nhất — dạy model phân biệt tụ tập bình thường vs xô xát trên cùng một khung camera.
 
+**KẾT QUẢ đợt mở rộng (đã chạy 2026-07-02/03 — kết luận: KHÔNG dùng, giữ checkpoint 5 bộ):**
+
+| Biến thể (VioPeru verdict multispan) | P | R | F1 |
+|---|---|---|---|
+| **5 bộ `vio_mvit_v2_s.pt` (giữ production)** | **0.877** | **0.664** | **0.756** |
+| 7 bộ warm-start từ ckpt cũ (`_7ds.pt`) | 0.811 | 0.614 | 0.699 |
+| 7 bộ from-Kinetics, data thô (`_7ds_scratch.pt`) | 0.827 | 0.579 | 0.681 |
+| 7 bộ from-Kinetics, data lọc nhãn (`_7ds_clean.pt`, val 0.905) | 0.773 | 0.607 | 0.680 |
+| như trên + train tiếp (`_7ds_clean_v2.pt`, val 0.907) | 0.743 | 0.579 | 0.651 |
+| ensemble max(cũ, lọc) | 0.798 | 0.593 | 0.680 |
+
+- UBI-Fights tải qua mirror Kaggle `intissarziani/ubi-fightsall` (trang socia-lab chết); UCF-Crime
+  qua HF `jinmang2/ucf_crime` (Fighting ở Part-2, Abuse+Assault Part-1) + annotation temporal phủ cả
+  train từ HF `backseollgi/UCF_Crime_ICML_annotation`. Cắt: `scripts/build_ubifights_clips.py` +
+  `scripts/build_ucfcrime_clips.py`. **Bẫy nhãn đã gặp:** negative "cùng bối cảnh" của UBI/UCF lẫn
+  bạo lực thật (44%/28% được ckpt cũ chấm prob>0.7) + lớp Abuse gần như tĩnh → đã audit bằng ckpt
+  cũ và loại 1211 clip (`data/exclude_clips.txt`); val 7-bộ lên 0.905 nhưng VioPeru vẫn không cải thiện.
+- **Thí nghiệm quyết định (finetune VioPeru theo cụm camera `and/sanj/tala`,
+  `--vioperu-train-groups sanj,tala`):** camera QUEN (video lạ) recall **0.64→0.91**; camera LẠ
+  (cụm `and` giữ ngoài) recall 0.46→0.43 (không ăn). → Domain-gap nằm ở TỪNG CAMERA, không phải
+  "phong cách CCTV" chung: **thêm dataset ngoài không phá được trần recall camera lạ; thu footage
+  từ chính camera triển khai (Như Quỳnh) rồi finetune là con đường duy nhất đã được chứng minh.**
+
 SCVD bỏ lớp **Weaponized** (súng/dao tĩnh ít motion → nhiễu nhãn cho 3D/transformer). Tải:
 `scripts/download_datasets.sh` + `scripts/build_scvd_clips.py`.
 

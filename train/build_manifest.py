@@ -1,4 +1,4 @@
-"""Quét 5 dataset → data/manifest.csv (cột path,label,dataset,split). Nguồn chân lý cho train.
+"""Quét 7 dataset → data/manifest.csv (cột path,label,dataset,split). Nguồn chân lý cho train.
 
 Thay heuristic chuỗi `label_of` (sai với "Weaponized") bằng LUẬT TỪNG DATASET rõ ràng. Split:
 - VioPeru → toàn bộ `test` (cross-domain, KHÔNG bao giờ train) — đo tổng quát hóa sang CCTV thật.
@@ -37,6 +37,15 @@ def _has(path: str, *names: str) -> bool:
     return any(n.lower() in segs for n in names)
 
 
+def _excluded() -> set[str]:
+    """data/exclude_clips.txt: clip bị loại sau audit nhãn (Abuse tĩnh, negative 'cùng bối cảnh'
+    mà model tin cậy chấm prob cao = nghi lẫn bạo lực). Mỗi dòng 1 path tương đối gốc repo."""
+    p = os.path.join(DATA, "exclude_clips.txt")
+    if not os.path.exists(p):
+        return set()
+    return {ln.strip() for ln in open(p, encoding="utf-8") if ln.strip()}
+
+
 def collect() -> list[tuple[str, int, str]]:
     """→ list (path, label, dataset). Bỏ qua file không khớp luật để tránh nhãn sai."""
     rows: list[tuple[str, int, str]] = []
@@ -69,6 +78,20 @@ def collect() -> list[tuple[str, int, str]]:
         elif _has(p, "Violence"):
             rows.append((p, 1, "SCVD"))
 
+    # UBI-Fights: clip đã cắt theo nhãn frame-level (scripts/build_ubifights_clips.py)
+    for p in _vids("UBIFights"):
+        if _has(p, "NonFight"):
+            rows.append((p, 0, "UBIFights"))
+        elif _has(p, "Fight"):
+            rows.append((p, 1, "UBIFights"))
+
+    # UCF-Crime: clip đã cắt theo annotation temporal (scripts/build_ucfcrime_clips.py)
+    for p in _vids("UCFCrime"):
+        if _has(p, "Normal"):
+            rows.append((p, 0, "UCFCrime"))
+        elif _has(p, "Fight"):
+            rows.append((p, 1, "UCFCrime"))
+
     # VioPeru: Fight / NonFight + false_positives_validation(→0). TẤT CẢ là test.
     for p in _vids("VioPeru"):
         if _has(p, "false_positives_validation") or _has(p, "NonFight"):
@@ -79,22 +102,57 @@ def collect() -> list[tuple[str, int, str]]:
     return rows
 
 
-def split(rows, val_frac: float, seed: int) -> list[tuple[str, int, str, str]]:
-    """VioPeru→test; còn lại stratified theo (dataset,label) → train/val."""
+def _group_key(path: str, ds: str) -> str:
+    """Đơn vị split. UBIFights/UCFCrime là CHUNK cắt từ video dài (<stem>_pNN/_nNN) →
+    gom theo video nguồn, không thì chunk cùng video lọt cả train lẫn val (leak, val ảo cao)."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if ds in ("UBIFights", "UCFCrime"):
+        import re
+        return re.sub(r"_[pn]\d+$", "", stem)
+    return stem
+
+
+def _vioperu_group(path: str) -> str:
+    """Cụm camera VioPeru từ tên file (nf100and.avi / val_nfsanj01.avi → and/sanj/tala)."""
+    import re
+    m = re.search(r"(and|sanj|tala)", os.path.basename(path))
+    return m.group(1) if m else ""
+
+
+def split(rows, val_frac: float, seed: int,
+          vioperu_train_groups: frozenset[str] = frozenset()) -> list[tuple[str, int, str, str]]:
+    """VioPeru→test; còn lại stratified theo (dataset,label) → train/val, đơn vị = video nguồn.
+
+    vioperu_train_groups: cụm camera VioPeru (and/sanj/tala) đưa vào TRAIN (finetune in-domain);
+    cụm còn lại vẫn test — thước đo "camera chưa thấy". Rỗng = VioPeru toàn bộ test (mặc định cũ)."""
     rng = random.Random(seed)
     out: list[tuple[str, int, str, str]] = []
-    buckets: dict[tuple[str, int], list[str]] = {}
+    buckets: dict[tuple[str, int], dict[str, list[str]]] = {}
+    group_split: dict[tuple[str, str], str] = {}  # (ds, group) → 'train'/'val' (nhất quán cả 2 nhãn)
     for p, y, ds in rows:
         if ds == "VioPeru":
-            out.append((p, y, ds, "test"))
+            if _vioperu_group(p) in vioperu_train_groups:
+                # đi qua bucket thường → có mặt cả train lẫn val (early-stop thấy tín hiệu in-domain)
+                buckets.setdefault((ds, y), {}).setdefault(_group_key(p, ds), []).append(p)
+            else:
+                out.append((p, y, ds, "test"))
         else:
-            buckets.setdefault((ds, y), []).append(p)
-    for (ds, y), paths in buckets.items():
-        paths = sorted(paths)
-        rng.shuffle(paths)
-        n_val = max(1, int(len(paths) * val_frac))
-        for i, p in enumerate(paths):
-            out.append((p, y, ds, "val" if i < n_val else "train"))
+            buckets.setdefault((ds, y), {}).setdefault(_group_key(p, ds), []).append(p)
+    for (ds, y), groups in sorted(buckets.items()):
+        names = sorted(groups)
+        rng.shuffle(names)
+        n_clips = sum(len(groups[g]) for g in names)
+        want_val = max(1, int(n_clips * val_frac))
+        got_val = 0
+        for g in names:
+            sp = group_split.get((ds, g))  # video nguồn đã gán ở nhãn kia → giữ nguyên phía
+            if sp is None:
+                sp = "val" if got_val < want_val else "train"
+                group_split[(ds, g)] = sp
+            if sp == "val":
+                got_val += len(groups[g])
+            for p in sorted(groups[g]):
+                out.append((p, y, ds, sp))
     return out
 
 
@@ -103,10 +161,23 @@ def main() -> None:
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default=os.path.join(DATA, "manifest.csv"))
+    ap.add_argument("--vioperu-train-groups", default="",
+                    help="cụm camera VioPeru đưa vào train, vd 'sanj,tala' (cụm còn lại vẫn test)")
+    ap.add_argument("--skip-datasets", default="",
+                    help="bỏ hẳn dataset khỏi manifest, vd 'UBIFights,UCFCrime'")
     args = ap.parse_args()
 
     rows = collect()
-    full = split(rows, args.val_frac, args.seed)
+    if args.skip_datasets:
+        skip = {s.strip() for s in args.skip_datasets.split(",") if s.strip()}
+        rows = [r for r in rows if r[2] not in skip]
+    excl = _excluded()
+    if excl:
+        n0 = len(rows)
+        rows = [r for r in rows if os.path.relpath(r[0], ROOT) not in excl]
+        print(f"[exclude] loại {n0 - len(rows)}/{len(excl)} clip theo data/exclude_clips.txt")
+    vp_groups = frozenset(s.strip() for s in args.vioperu_train_groups.split(",") if s.strip())
+    full = split(rows, args.val_frac, args.seed, vp_groups)
     full.sort(key=lambda r: (r[3], r[2], r[1], r[0]))
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
