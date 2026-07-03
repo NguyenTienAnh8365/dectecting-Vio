@@ -78,6 +78,13 @@ def collect() -> list[tuple[str, int, str]]:
         elif _has(p, "Violence"):
             rows.append((p, 1, "SCVD"))
 
+    # CCTV-Fights (ROSE NTU): clip trim theo groundtruth (scripts/build_cctvfights_clips.py)
+    for p in _vids("CCTVFights"):
+        if _has(p, "NonFight"):
+            rows.append((p, 0, "CCTVFights"))
+        elif _has(p, "Fight"):
+            rows.append((p, 1, "CCTVFights"))
+
     # VioPeru: Fight / NonFight + false_positives_validation(→0). TẤT CẢ là test.
     for p in _vids("VioPeru"):
         if _has(p, "false_positives_validation") or _has(p, "NonFight"):

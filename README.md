@@ -126,6 +126,12 @@ cp .env.example .env           # điền LIVE_CAMS, trỏ VIO_ENGINE/GATE_MODEL 
   **Bẫy nhãn đã gặp:** negative "cùng bối cảnh" của UBI/UCF lẫn bạo lực thật (44%/28% được ckpt
   cũ chấm prob>0.7) + lớp Abuse gần như tĩnh → audit bằng ckpt cũ rồi lọc; val 7-bộ lên 0.905
   nhưng VioPeru vẫn không cải thiện.
+- **CCTV-Fights (ROSE NTU, 2026-07-03, cần agreement):** 1000 video untrimmed (280 CCTV/707 mobile),
+  2414 segment Fight NGƯỜI GÁN → trim trọn segment (`scripts/build_cctvfights_clips.py`), audit:
+  positive RẤT sạch (median prob 1.0) nhưng negative ngoài-segment vẫn 37% nóng → loại 787
+  (`data/exclude_clips.txt`). Finetune warm-start ckpt cũ + 5 bộ (LR 5e-5) → `_cctvf.pt`:
+  clip-level **F1 0.735/AUC 0.893 (vượt baseline)** nhưng verdict 0.740 < 0.756 (≈2 video, nhiễu);
+  ensemble không giúp. **Kết luận: hòa — bộ ngoài duy nhất không gây hại; production vẫn ckpt cũ.**
 - **Thí nghiệm quyết định (finetune VioPeru theo cụm camera `and/sanj/tala`,
   `--vioperu-train-groups sanj,tala`):** camera QUEN (video lạ) recall **0.64→0.91**; camera LẠ
   (cụm `and` giữ ngoài) recall 0.46→0.43 (không ăn). → Domain-gap nằm ở TỪNG CAMERA, không phải
