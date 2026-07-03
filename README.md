@@ -121,12 +121,11 @@ cp .env.example .env           # điền LIVE_CAMS, trỏ VIO_ENGINE/GATE_MODEL 
 | như trên + train tiếp (`_7ds_clean_v2.pt`, val 0.907) | 0.743 | 0.579 | 0.651 |
 | ensemble max(cũ, lọc) | 0.798 | 0.593 | 0.680 |
 
-- UBI-Fights tải qua mirror Kaggle `intissarziani/ubi-fightsall` (trang socia-lab chết); UCF-Crime
-  qua HF `jinmang2/ucf_crime` (Fighting ở Part-2, Abuse+Assault Part-1) + annotation temporal phủ cả
-  train từ HF `backseollgi/UCF_Crime_ICML_annotation`. Cắt: `scripts/build_ubifights_clips.py` +
-  `scripts/build_ucfcrime_clips.py`. **Bẫy nhãn đã gặp:** negative "cùng bối cảnh" của UBI/UCF lẫn
-  bạo lực thật (44%/28% được ckpt cũ chấm prob>0.7) + lớp Abuse gần như tĩnh → đã audit bằng ckpt
-  cũ và loại 1211 clip (`data/exclude_clips.txt`); val 7-bộ lên 0.905 nhưng VioPeru vẫn không cải thiện.
+- Dữ liệu + script UBI/UCF đã GỠ khỏi repo sau kết luận (lấy lại ở commit `da9d5e0` nếu cần:
+  script tải mirror Kaggle/HF, script cắt clip, danh sách 1211 clip nhãn bẩn đã loại).
+  **Bẫy nhãn đã gặp:** negative "cùng bối cảnh" của UBI/UCF lẫn bạo lực thật (44%/28% được ckpt
+  cũ chấm prob>0.7) + lớp Abuse gần như tĩnh → audit bằng ckpt cũ rồi lọc; val 7-bộ lên 0.905
+  nhưng VioPeru vẫn không cải thiện.
 - **Thí nghiệm quyết định (finetune VioPeru theo cụm camera `and/sanj/tala`,
   `--vioperu-train-groups sanj,tala`):** camera QUEN (video lạ) recall **0.64→0.91**; camera LẠ
   (cụm `and` giữ ngoài) recall 0.46→0.43 (không ăn). → Domain-gap nằm ở TỪNG CAMERA, không phải

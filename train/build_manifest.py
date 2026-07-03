@@ -78,20 +78,6 @@ def collect() -> list[tuple[str, int, str]]:
         elif _has(p, "Violence"):
             rows.append((p, 1, "SCVD"))
 
-    # UBI-Fights: clip đã cắt theo nhãn frame-level (scripts/build_ubifights_clips.py)
-    for p in _vids("UBIFights"):
-        if _has(p, "NonFight"):
-            rows.append((p, 0, "UBIFights"))
-        elif _has(p, "Fight"):
-            rows.append((p, 1, "UBIFights"))
-
-    # UCF-Crime: clip đã cắt theo annotation temporal (scripts/build_ucfcrime_clips.py)
-    for p in _vids("UCFCrime"):
-        if _has(p, "Normal"):
-            rows.append((p, 0, "UCFCrime"))
-        elif _has(p, "Fight"):
-            rows.append((p, 1, "UCFCrime"))
-
     # VioPeru: Fight / NonFight + false_positives_validation(→0). TẤT CẢ là test.
     for p in _vids("VioPeru"):
         if _has(p, "false_positives_validation") or _has(p, "NonFight"):
@@ -103,13 +89,12 @@ def collect() -> list[tuple[str, int, str]]:
 
 
 def _group_key(path: str, ds: str) -> str:
-    """Đơn vị split. UBIFights/UCFCrime là CHUNK cắt từ video dài (<stem>_pNN/_nNN) →
-    gom theo video nguồn, không thì chunk cùng video lọt cả train lẫn val (leak, val ảo cao)."""
+    """Đơn vị split = VIDEO NGUỒN. Với dataset dạng chunk cắt từ video dài (đặt tên
+    <stem>_pNN/_nNN — vd footage CCTV địa phương sau này) gom theo stem gốc, không thì
+    chunk cùng video lọt cả train lẫn val (leak, val ảo cao). Bài học đợt UBI/UCF 2026-07."""
     stem = os.path.splitext(os.path.basename(path))[0]
-    if ds in ("UBIFights", "UCFCrime"):
-        import re
-        return re.sub(r"_[pn]\d+$", "", stem)
-    return stem
+    import re
+    return re.sub(r"_[pn]\d+$", "", stem)
 
 
 def _vioperu_group(path: str) -> str:

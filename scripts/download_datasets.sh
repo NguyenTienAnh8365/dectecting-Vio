@@ -22,29 +22,6 @@ echo "== Surveillance Fight (GitHub, 300 clip) =="
 echo "== SCVD (HF parquet-frame → tái dựng mp4, đã loại Weaponized) =="
 $PY scripts/build_scvd_clips.py
 
-echo "== UBI-Fights (mirror Kaggle — trang gốc socia-lab chết; kagglehub KHÔNG cần API key) =="
-$PY - <<'PY'
-import kagglehub
-print("→", kagglehub.dataset_download("intissarziani/ubi-fightsall"))
-PY
-$PY scripts/build_ubifights_clips.py
-
-echo "== UCF-Crime (HF jinmang2/ucf_crime — chỉ Part-1 Abuse/Assault + Part-2 Fighting + Normal) =="
-$PY - <<'PY'
-from huggingface_hub import hf_hub_download
-for f in ["Anomaly-Videos-Part-1.zip","Anomaly-Videos-Part-2.zip",
-          "Testing_Normal_Videos.zip","Normal_Videos_for_Event_Recognition.zip"]:
-    hf_hub_download("jinmang2/ucf_crime", f, repo_type="dataset", local_dir="data/_dl/ucfcrime")
-# annotation temporal phủ CẢ train (chính thức CRCV chỉ có test)
-for f in ["ucf_database_train_step13_5sec_3sec_category.json",
-          "ucf_database_test_step13_5sec_3sec_category.json"]:
-    hf_hub_download("backseollgi/UCF_Crime_ICML_annotation", f, repo_type="dataset", local_dir="data/_dl/ucfcrime")
-PY
-mkdir -p data/_dl/ucfcrime/raw
-unzip -q -o data/_dl/ucfcrime/Anomaly-Videos-Part-1.zip 'Anomaly-Videos-Part-1/Abuse/*' 'Anomaly-Videos-Part-1/Assault/*' -d data/_dl/ucfcrime/raw
-unzip -q -o data/_dl/ucfcrime/Anomaly-Videos-Part-2.zip 'Anomaly-Videos-Part-2/Fighting/*' -d data/_dl/ucfcrime/raw
-unzip -q -o data/_dl/ucfcrime/Testing_Normal_Videos.zip -d data/_dl/ucfcrime/raw
-unzip -q -o data/_dl/ucfcrime/Normal_Videos_for_Event_Recognition.zip -d data/_dl/ucfcrime/raw
-$PY scripts/build_ucfcrime_clips.py
-
-echo "DONE. Tiếp: $PY -m train.build_manifest  (data/exclude_clips.txt tự được áp nếu có)"
+echo "DONE. Tiếp: $PY -m train.build_manifest"
+# UBI-Fights + UCF-Crime từng thêm rồi GỠ (không giảm gap camera lạ — xem README
+# "KẾT QUẢ đợt mở rộng"). Script tải/cắt nằm ở git history (commit da9d5e0) nếu cần lại.
