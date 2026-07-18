@@ -112,6 +112,7 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
     win: deque = deque(maxlen=span)
     box_hist: deque = deque(maxlen=span)   # bbox người từng frame → crop vùng người
     since, prob, pos_windows, strong_hits, max_prob, max_t = 0, 0.0, 0, 0, 0.0, 0.0
+    strong_streak, max_strong_streak = 0, 0
     timeline, idx = [], 0
     poster, first_frame = None, None
     boxes: list = []                       # tái dùng giữa các lần chạy gate (overlay không nháy)
@@ -147,8 +148,15 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
             timeline.append({"t": round(t, 2), "prob": round(prob, 3), "strong": is_strong})
             if prob >= config.VIO_THRESHOLD and enough_persons:
                 pos_windows += 1
-            if is_strong:                             # 1 cửa sổ mạnh đã đủ → không bỏ sót hành động ngắn
+            # Đường mạnh cần VIO_STRONG_STREAK cửa sổ LIÊN TIẾP (đồng bộ dashboard live):
+            # spike 1 cửa sổ (rung máy, đứng/ngồi đột ngột) không tính; cú đánh thật vẫn cao
+            # nhiều cửa sổ liền nhau nhờ cửa sổ trượt 3s/7s.
+            if is_strong:
                 strong_hits += 1
+                strong_streak += 1
+                max_strong_streak = max(max_strong_streak, strong_streak)
+            else:
+                strong_streak = 0
             if prob > max_prob:                       # giữ khung "căng" nhất làm poster
                 max_prob, max_t = prob, t
                 poster = (frame.copy(), list(boxes), prob)
@@ -188,8 +196,8 @@ def analyze_video(in_path: str, out_path: str, on_progress=None) -> dict:
     return {
         "frames": idx,
         "fps": round(fps, 1),
-        # verdict = đủ K/N ở mức thấp (kéo dài) HOẶC có ≥1 cửa sổ ở mức mạnh (chớp nhoáng).
-        "violence": pos_windows >= config.ALERT_K or strong_hits > 0,
+        # verdict = đủ K/N ở mức thấp (kéo dài) HOẶC đủ streak cửa sổ mạnh liên tiếp (chớp nhoáng).
+        "violence": pos_windows >= config.ALERT_K or max_strong_streak >= config.VIO_STRONG_STREAK,
         "max_prob": round(max_prob, 3),
         "max_at": round(max_t, 2),
         "pos_windows": pos_windows,

@@ -137,9 +137,17 @@ def frames_to_clip_gpu(frames: list[np.ndarray], backbone: str, device: str):
     size = sp["size"]
     mean, std = _mean_std_gpu(backbone, device)
     arr = np.stack(frames, axis=0)                                    # [T,H,W,C] uint8 BGR
-    t = torch.from_numpy(arr).to(device)
-    t = t[..., [2, 1, 0]].permute(0, 3, 1, 2).float() / 255.0          # [T,C,H,W] RGB float
-    t = Fn.interpolate(t, size=(size, size), mode="area")
+    t8 = torch.from_numpy(arr).to(device).permute(0, 3, 1, 2)          # [T,C,H,W] uint8 BGR (view)
+    # Resize theo CHUNK + đảo kênh SAU resize: bản cũ convert float32 + copy BGR→RGB trên
+    # NGUYÊN clip full-res (camera 2304×1296 → ~0.6GB/clip × 4 clip multispan song song →
+    # allocator giữ 8GB+ VRAM). Giờ tensor float full-res chỉ tồn tại 4 frame/lần (~140MB),
+    # reorder kênh làm trên tensor 224×224. Kết quả SỐ HỌC không đổi (area-resize tuyến tính
+    # theo kênh, /255 và đảo kênh giao hoán với resize).
+    out = torch.empty((t8.shape[0], 3, size, size), device=device)
+    for i in range(0, t8.shape[0], 4):
+        chunk = t8[i:i + 4].float().div_(255.0)
+        out[i:i + 4] = Fn.interpolate(chunk, size=(size, size), mode="area")
+    t = out[:, [2, 1, 0]]                                             # BGR→RGB (tensor nhỏ)
     t = (t - mean) / std
     return t.permute(1, 0, 2, 3)                                      # [C,T,H,W]
 

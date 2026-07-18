@@ -29,7 +29,41 @@ def _load_dotenv() -> None:
             os.environ.setdefault(k, v)
 
 
+def _harden_console() -> None:
+    """Console Windows có thể trả OSError WinError 1 khi write (console mode bị tiến trình
+    khác đổi) — một lệnh print không được phép giết thread pipeline."""
+    import io
+    import sys
+
+    class _SafeWriter(io.TextIOBase):
+        def __init__(self, raw):
+            self._raw = raw
+
+        def write(self, s: str) -> int:
+            try:
+                return self._raw.write(s)
+            except OSError:
+                return len(s)
+
+        def flush(self) -> None:
+            try:
+                self._raw.flush()
+            except OSError:
+                pass
+
+        @property
+        def encoding(self):
+            return getattr(self._raw, "encoding", "utf-8")
+
+    for name in ("stdout", "stderr"):
+        raw = getattr(sys, name)
+        if raw is not None:
+            setattr(sys, name, _SafeWriter(raw))
+
+
 _load_dotenv()
+if os.name == "nt":
+    _harden_console()
 
 
 def _int(name: str, default: int) -> int:
@@ -137,7 +171,12 @@ MODEL_VERSION = os.getenv("MODEL_VERSION", "untrained")
 #     cần đủ K/N. Bắt cú đánh/tát chớp nhoáng — "1 hành động nhỏ cũng là bạo lực".
 # => verdict = (đủ K/N ở mức thấp) OR (có ≥1 cửa sổ ở mức mạnh). Cả hai vẫn qua gate người.
 VIO_THRESHOLD = _float("VIO_THRESHOLD", 0.50)         # ngưỡng "dương" cho đường kéo dài
-VIO_THRESHOLD_STRONG = _float("VIO_THRESHOLD_STRONG", 0.80)  # 1 cửa sổ ≥ mức này → alert ngay
+VIO_THRESHOLD_STRONG = _float("VIO_THRESHOLD_STRONG", 0.80)  # cửa sổ "mạnh" khi prob ≥ mức này
+# Đường mạnh cần STREAK cửa sổ mạnh LIÊN TIẾP (không phải 1): spike nhiễu 1 cửa sổ (lắc cam,
+# đứng lên ngồi xuống đột ngột — chuyển động toàn khung giống bạo lực với model) chết hẳn,
+# còn cú đánh thật dù chớp nhoáng vẫn nằm trong cửa sổ trượt 3s/7s của ~6 lần chấm liên tiếp
+# → prob cao ở nhiều cửa sổ liền nhau, chỉ trễ thêm 1 nhịp chấm (~0.5s), KHÔNG mất phát hiện.
+VIO_STRONG_STREAK = _int("VIO_STRONG_STREAK", 2)
 # K/N định nghĩa theo SỐ CỬA SỔ nên ngữ nghĩa THỜI GIAN phụ thuộc nhịp chấm (WIN_STRIDE/GRAB_FPS).
 # Thiết kế gốc (tune trên VioPeru): ~2s dương trong ~3.3s. @30fps stride 15 (chấm mỗi 0.5s):
 # K=4/N=7 = 2s dương trong 3.5s — GIỮ NGUYÊN ngữ nghĩa đó. Đổi stride thì tính lại:
@@ -152,6 +191,9 @@ MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
 # k-of-n mượn snapshot của cửa sổ DƯƠNG gần nhất (dashboard._handle_live_result), nếu cửa sổ
 # dương mà không lưu media thì alert trắng ảnh. Kẹp cứng để không ai chỉnh lệch được.
 SAVE_PROB = min(_float("SAVE_PROB", 0.50), VIO_THRESHOLD)
+# Độ dài clip bằng chứng (giây, NHỊP THẬT — lấy các frame cuối buffer theo timestamp).
+# Trước đây lưu 16 frame trải đều cả buffer 7s phát ở 12fps → clip ~1.3s kiểu tua nhanh, khó xem.
+EVIDENCE_CLIP_S = _float("EVIDENCE_CLIP_S", 3.0)
 MEDIA_TTL_DAYS = _int("MEDIA_TTL_DAYS", 3)
 
 # --- Dashboard --------------------------------------------------------------

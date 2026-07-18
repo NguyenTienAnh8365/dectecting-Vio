@@ -161,6 +161,33 @@ class LiveCam:
         self.busy = False
 
 
+# Registry camera đang chạy — dashboard đọc frame mới nhất để phát MJPEG (/stream/{id}).
+_registry: dict[str, LiveCam] = {}
+
+
+def latest_jpeg(camera_id: str, max_w: int = 960, quality: int = 70):
+    """JPEG frame MỚI NHẤT của 1 camera (kèm bbox người) cho live view — trả (bytes, seq)
+    hoặc None nếu camera chưa có frame. seq để caller biết frame đã đổi chưa (khỏi encode lại)."""
+    cam = _registry.get(camera_id)
+    if cam is None:
+        return None
+    frame, _ts, seq = cam.box.get()
+    if frame is None:
+        return None
+    boxes = cam.window.boxes_last
+    if boxes:
+        frame = frame.copy()
+        for (x, y, w, h) in boxes:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 200, 0), 2)
+    h0, w0 = frame.shape[:2]
+    if w0 > max_w:
+        frame = cv2.resize(frame, (max_w, round(h0 * max_w / w0)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return buf.tobytes(), seq
+
+
 def _capture_worker(camera_id: str, src: str, fps: float, loop: bool, box: FrameBox) -> None:
     """Đọc 1 nguồn liên tục, chỉ ghi vào FrameBox (không encode/không Redis).
 
@@ -259,7 +286,7 @@ def _process_one(cam: LiveCam, gate_model) -> bool:
         # mailbox bỏ frame) thì khoảng cách frame giãn ra — đếm số frame nằm trong s giây cuối
         # cho đúng span thời gian, hết hẳn giới hạn "cửa sổ trải dài hơn WIN_SECONDS" ở docstring.
         job = {
-            "frames": fr_all, "boxes": bx_all,
+            "frames": fr_all, "boxes": bx_all, "tss": ts_all,
             "spans": [sum(1 for t in ts_all if t >= ts - s) for s in config.WIN_SECONDS_LIST],
             "persons": list(w.persons), "boxes_last": w.boxes_last,
             "ts": ts, "seq": seq,
@@ -288,7 +315,16 @@ def _classify_one(cam: LiveCam, job: dict, model, on_result: Callable[[str, dict
         mid = frames[len(frames) // 2]
         snap = annotate(mid, job["boxes_last"], prob)
         snapshot_key = media.save_snapshot_async(cam.id, job["ts"], snap)
-        clip_key = media.save_clip_async(cam.id, job["ts"], frames)
+        # Clip bằng chứng = EVIDENCE_CLIP_S giây CUỐI ở nhịp thật (đếm frame theo timestamp),
+        # không phải 16 frame trải đều buffer 7s (clip tua nhanh ~1.3s, khó xem). Subsample
+        # xuống ≤16fps để encode nhẹ (75-90 frame full-res mỗi lần lưu là thừa).
+        cnt = sum(1 for t in job["tss"] if t >= job["ts"] - config.EVIDENCE_CLIP_S)
+        ev = fr_all[-max(cnt, config.WIN_LEN):]
+        ev_fps = len(ev) / config.EVIDENCE_CLIP_S
+        while ev_fps > 16 and len(ev) > config.WIN_LEN:
+            ev = ev[::2]
+            ev_fps /= 2
+        clip_key = media.save_clip_async(cam.id, job["ts"], ev, fps=max(ev_fps, 4.0))
 
     result = {
         "prob": round(prob, 4),
@@ -401,6 +437,8 @@ def run_live(cam_specs: list[tuple[str, str]], on_result: Callable[[str, dict], 
     config.GRAB_FPS = fps
     config.WIN_SPAN = max(config.WIN_LEN, round(config.WIN_SECONDS * fps))
     cams = [LiveCam(name, src) for name, src in cam_specs]
+    _registry.clear()
+    _registry.update({c.id: c for c in cams})
 
     threads = []
     for cam in cams:

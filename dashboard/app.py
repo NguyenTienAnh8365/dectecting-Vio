@@ -108,6 +108,7 @@ _alerts: deque = deque(maxlen=100)          # alert gần nhất (mới ở đ�
 _windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=config.ALERT_N))
 _last_alert: dict[str, float] = {}
 _last_positive: dict[str, dict] = {}  # camera_id → result DƯƠNG gần nhất (prob cao + có media)
+_strong_streak: dict[str, int] = defaultdict(int)  # số cửa sổ MẠNH liên tiếp (đường mạnh cần streak)
 _subscribers: list[asyncio.Queue] = []
 _loop: asyncio.AbstractEventLoop | None = None
 _alert_seq = 0
@@ -142,9 +143,13 @@ def _handle_live_result(camera_id: str, result: dict) -> None:
         w.append(1 if positive else 0)
         if positive:
             _last_positive[camera_id] = result
-        # Alert khi: đủ K/N cửa sổ dương (kéo dài) HOẶC 1 cửa sổ mạnh (chớp nhoáng, không để
-        # k-of-n nuốt mất). Cả hai vẫn tôn trọng cooldown chống spam.
-        fire = ((sum(w) >= config.ALERT_K or strong)
+        # Đường mạnh cần VIO_STRONG_STREAK cửa sổ mạnh LIÊN TIẾP — spike 1 cửa sổ (lắc cam,
+        # đứng/ngồi đột ngột) không nổ được; cú đánh thật vẫn cao nhiều cửa sổ liền (xem config).
+        _strong_streak[camera_id] = _strong_streak[camera_id] + 1 if strong else 0
+        # Alert khi: đủ K/N cửa sổ dương (kéo dài) HOẶC đủ streak cửa sổ mạnh (chớp nhoáng,
+        # không để k-of-n nuốt mất). Cả hai vẫn tôn trọng cooldown chống spam.
+        fire = ((sum(w) >= config.ALERT_K
+                 or _strong_streak[camera_id] >= config.VIO_STRONG_STREAK)
                 and now - _last_alert.get(camera_id, 0) >= config.COOLDOWN_S)
         alert = None
         if fire:
@@ -265,6 +270,25 @@ async def delete_analysis(job_id: str):
         except OSError:
             pass
     return {"ok": True, "removed": removed}
+
+
+@app.get("/stream/{camera_id}")
+async def stream(camera_id: str):
+    """Live view MJPEG: đẩy frame mới nhất của camera (~12fps, resize + JPEG) — <img> trên UI
+    trỏ thẳng vào đây. Chỉ encode khi frame đổi (theo seq), encode chạy trong threadpool."""
+    async def gen():
+        last_seq = -1
+        while True:
+            data = await run_in_threadpool(live.latest_jpeg, camera_id)
+            if data is not None:
+                jpg, seq = data
+                if seq != last_seq:
+                    last_seq = seq
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                           + f"Content-Length: {len(jpg)}\r\n\r\n".encode() + jpg + b"\r\n")
+            await asyncio.sleep(1 / 12)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.get("/events")
@@ -719,6 +743,14 @@ button { border: 0; }
   background: var(--ok);
   transition: width .35s ease, background .35s ease;
 }
+.c-video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  object-fit: cover;
+  background: #151b27;
+  border-radius: var(--radius);
+}
 .c-persons {
   display: flex;
   align-items: center;
@@ -1064,26 +1096,40 @@ function renderCam(id, p, np) {
   grid.querySelector('.empty')?.remove();
   let el = camEls[id];
   if (!el) {
+    // Dựng khung 1 LẦN (img MJPEG /stream không được reload mỗi lần cập nhật prob),
+    // các lần sau chỉ cập nhật số liệu qua querySelector.
     el = document.createElement('div');
+    el.innerHTML = `
+      <div class="c-top">
+        <div class="c-name"><i class="ti ti-camera" aria-hidden="true"></i><span>${esc(id)}</span></div>
+        <div class="c-status"></div>
+      </div>
+      <img class="c-video" src="/stream/${encodeURIComponent(id)}" alt="">
+      <div>
+        <div class="risk-row">
+          <div class="risk-label">Xác suất bạo lực</div>
+          <div class="risk-value"></div>
+        </div>
+        <div class="meter"><i></i></div>
+      </div>
+      <div class="c-persons"><i class="ti ti-users" aria-hidden="true"></i><span></span></div>`;
     grid.appendChild(el);
     camEls[id] = el;
+    el.querySelector('.c-video').onclick = () =>
+      openModal('Trực tiếp · ' + id, '/stream/' + encodeURIComponent(id), 'img');
   }
   const pct = Math.round(p * 100);
-  const level = p >= .7 ? 'danger' : p >= .4 ? 'warn' : '';
   el.className = 'c-card' + (p >= .7 ? ' d' : p >= .4 ? ' w' : '');
-  el.innerHTML = `
-    <div class="c-top">
-      <div class="c-name"><i class="ti ti-camera" aria-hidden="true"></i><span>${esc(id)}</span></div>
-      <div class="c-status ${level}">${riskText(p)}</div>
-    </div>
-    <div>
-      <div class="risk-row">
-        <div class="risk-label">Xác suất bạo lực</div>
-        <div class="risk-value" style="color:${riskColor(p)}">${pct}%</div>
-      </div>
-      <div class="meter"><i style="width:${pct}%;background:${riskColor(p)}"></i></div>
-    </div>
-    <div class="c-persons"><i class="ti ti-users" aria-hidden="true"></i>${np} người trong khung hình</div>`;
+  const st = el.querySelector('.c-status');
+  st.className = 'c-status ' + (p >= .7 ? 'danger' : p >= .4 ? 'warn' : '');
+  st.textContent = riskText(p);
+  const rv = el.querySelector('.risk-value');
+  rv.style.color = riskColor(p);
+  rv.textContent = pct + '%';
+  const bar = el.querySelector('.meter i');
+  bar.style.width = pct + '%';
+  bar.style.background = riskColor(p);
+  el.querySelector('.c-persons span').textContent = np + ' người trong khung hình';
   updateSummary();
 }
 

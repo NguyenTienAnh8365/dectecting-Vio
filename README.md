@@ -187,10 +187,12 @@ Dừng nền: `pkill -f 'dashboard\.app'`
 
 **Ngưỡng KÉP theo độ tin cậy** ([transport/config.py](transport/config.py)) — tránh bỏ sót hành động bạo lực ngắn:
 ```
-verdict = (số cửa sổ prob ≥ VIO_THRESHOLD đạt K/N)   OR   (≥1 cửa sổ prob ≥ VIO_THRESHOLD_STRONG)
+verdict = (số cửa sổ prob ≥ VIO_THRESHOLD đạt K/N)   OR   (VIO_STRONG_STREAK cửa sổ LIÊN TIẾP ≥ VIO_THRESHOLD_STRONG)
 ```
 - Đường **kéo dài** (k-of-n): bạo lực độ tin cậy vừa nhưng liên tục; lọc nhiễu lẻ (chống FP).
-- Đường **mạnh** (1 cửa sổ ≥ ngưỡng cao): bắt cú đánh/tát chớp nhoáng — "1 hành động nhỏ cũng là bạo lực".
+- Đường **mạnh** (streak cửa sổ ≥ ngưỡng cao liên tiếp): bắt cú đánh/tát chớp nhoáng — "1 hành động nhỏ
+  cũng là bạo lực". Cần LIÊN TIẾP (mặc định 2) để giết spike 1 cửa sổ (lắc camera, đứng lên ngồi xuống
+  đột ngột); cú đánh thật vẫn cao nhiều cửa sổ liền nhau nhờ cửa sổ trượt 3s/7s, chỉ trễ thêm ~0.5s.
 - Cả hai vẫn qua gate `MIN_PERSONS`.
 
 **Crop vùng người trước classifier** ([transport/model.py](transport/model.py) `person_crop_box`) — bù
@@ -207,7 +209,7 @@ nhãn, sweep (T_low, T_strong, K) → Precision/Recall/F1 để chọn ngưỡng
 |---|---|---|---|
 | Cửa sổ | `WIN_LEN` · `WIN_STRIDE` | 16 · 8 | clip 16 frame, phân loại lại mỗi 8 frame |
 | Ngưỡng thấp | `VIO_THRESHOLD` | 0.50 | cửa sổ "dương" cho đường k-of-n |
-| Ngưỡng mạnh | `VIO_THRESHOLD_STRONG` | 0.80 | 1 cửa sổ ≥ mức này → alert ngay |
+| Ngưỡng mạnh | `VIO_THRESHOLD_STRONG` · `VIO_STRONG_STREAK` | 0.80 · 2 | cần 2 cửa sổ mạnh LIÊN TIẾP → alert |
 | Smoothing | `ALERT_K` / `ALERT_N` | 3 / 5 | cần 3/5 cửa sổ dương → alert |
 | Spam | `COOLDOWN_S` | 45 | mỗi camera tối đa 1 alert / 45s |
 | Person-gate | `MIN_PERSONS` | 2 | <2 người thì không alert |
